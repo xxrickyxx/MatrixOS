@@ -1,0 +1,6 @@
+# ISO e modelli pesanti
+*.iso
+*.gguf
+
+# Rust build (IMPORTANTISSIMO)
+target/
