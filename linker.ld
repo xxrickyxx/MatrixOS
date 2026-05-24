@@ -6,6 +6,7 @@ PHDRS
     text    PT_LOAD    FLAGS((1 << 0) | (1 << 2)) ; /* Execute + Read */
     rodata  PT_LOAD    FLAGS((1 << 2)) ;            /* Read only */
     data    PT_LOAD    FLAGS((1 << 1) | (1 << 2)) ; /* Write + Read */
+    bss     PT_LOAD    FLAGS((1 << 1) | (1 << 2)) ; /* Write + Read, NOBITS */
 }
 
 SECTIONS
@@ -32,12 +33,16 @@ SECTIONS
 
     .data : {
         *(.data .data.*)
+        *(.requests)
+        *(.got .got.*)
+        *(.got.plt)
+        *(.data.rel.ro .data.rel.ro.*)
     } :data
 
     .bss : {
         *(COMMON)
         *(.bss .bss.*)
-    } :data
+    } :bss
 
     /* Discard .note.* and .eh_frame since they may cause issues on some hosts. */
     /DISCARD/ : {

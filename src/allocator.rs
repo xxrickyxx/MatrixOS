@@ -1,14 +1,16 @@
+use core::mem::MaybeUninit;
 use linked_list_allocator::LockedHeap;
+
+const HEAP_SIZE: usize = 20 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-pub static mut HEAP_MEM: [u8; 16 * 1024 * 1024] = [0u8; 16 * 1024 * 1024];
+// MaybeUninit goes to BSS — zero-overhead in the ELF file.
+static mut HEAP_STORAGE: MaybeUninit<[u8; HEAP_SIZE]> = MaybeUninit::uninit();
 
 pub fn init() {
     unsafe {
-        // Inizializziamo l'allocatore usando il buffer statico nel kernel.
-        // Questo è sicuro perché Limine mappa tutto il kernel come scrivibile.
-        ALLOCATOR.lock().init(HEAP_MEM.as_mut_ptr(), HEAP_MEM.len());
+        ALLOCATOR.lock().init(HEAP_STORAGE.as_mut_ptr() as *mut u8, HEAP_SIZE);
     }
 }
