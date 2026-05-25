@@ -110,45 +110,49 @@ enum LineEvent {
 
 fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
     let mut len = 0usize;
-    vga::draw_input_line(buf, len);
+    let mut dirty = true;
 
     loop {
-        let sc = loop {
-            if let Some(s) = kb.read_scancode() { break s; }
-            unsafe { core::arch::asm!("pause"); }
-        };
+        if dirty {
+            vga::draw_input_line(buf, len);
+            dirty = false;
+        }
 
-        // Note: shift make/break IS handled inside scancode_to_char now.
-        // Ignore non-shift releases.
-        if sc & 0x80 != 0 && sc != 0xAA && sc != 0xB6 { continue; }
-
-        if let Some(ch) = kb.scancode_to_char(sc) {
-            match ch {
-                '\n' => {
-                    vga::draw_input_line(&[], 0);
-                    return LineEvent::Line(len);
-                }
-                '\x08' => {
-                    if len > 0 {
-                        len -= 1;
-                        vga::draw_input_line(buf, len);
+        // Drain ALL pending scancodes in a tight loop before redrawing.
+        // Without this, the redraw between keys (~10 ms of pixel pushing)
+        // makes us miss bytes from the PS/2 controller's 1-byte FIFO when
+        // the host types fast (computer-use, paste, etc.).
+        let mut produced_something = false;
+        while let Some(sc) = kb.read_scancode() {
+            produced_something = true;
+            if sc & 0x80 != 0 && sc != 0xAA && sc != 0xB6 { continue; }
+            if let Some(ch) = kb.scancode_to_char(sc) {
+                match ch {
+                    '\n' => {
+                        vga::draw_input_line(&[], 0);
+                        return LineEvent::Line(len);
                     }
-                }
-                // F-keys / TAB / ESC: bubble up as hotkeys
-                c if (c as u32) < 0x20 && c != '\n' && c != '\x08'
-                    || c == keyboard::KEY_TAB
-                    || c == keyboard::KEY_ESC => {
-                    vga::draw_input_line(&[], 0);
-                    return LineEvent::Hotkey(c);
-                }
-                c => {
-                    if len < buf.len() - 1 && (c as u32) < 128 {
-                        buf[len] = c as u8;
-                        len += 1;
-                        vga::draw_input_line(buf, len);
+                    '\x08' => {
+                        if len > 0 { len -= 1; dirty = true; }
+                    }
+                    c if (c as u32) < 0x20 && c != '\n' && c != '\x08'
+                        || c == keyboard::KEY_TAB
+                        || c == keyboard::KEY_ESC => {
+                        vga::draw_input_line(&[], 0);
+                        return LineEvent::Hotkey(c);
+                    }
+                    c => {
+                        if len < buf.len() - 1 && (c as u32) < 128 {
+                            buf[len] = c as u8;
+                            len += 1;
+                            dirty = true;
+                        }
                     }
                 }
             }
+        }
+        if !produced_something {
+            unsafe { core::arch::asm!("pause"); }
         }
     }
 }
@@ -207,6 +211,7 @@ fn handle_slash_command(
             vga::term_puts("  /apps              list installed apps\n", vga::C_DIM);
             vga::term_puts("  /run <name>        execute an app\n", vga::C_DIM);
             vga::term_puts("  /create <name> <desc>   AI builds the app\n", vga::C_DIM);
+            vga::term_puts("  /disks             list storage controllers\n", vga::C_DIM);
             vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
             vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
             vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
@@ -256,6 +261,33 @@ fn handle_slash_command(
             vga::term_puts("--- end ---\n", vga::C_DIM);
             // Silence unused-warning for the resources we may add later.
             let _ = gpu; let _ = storage;
+        }
+        "/disks" => {
+            // Walk PCI again so we list every storage controller, not just the
+            // best one stored in the summary.
+            vga::term_puts("Storage controllers detected:\n", vga::C_CYAN);
+            let mut count = 0u32;
+            pci::enumerate(|d| {
+                if d.is_storage() {
+                    count += 1;
+                    vga::term_puts("  ", 0);
+                    vga::term_puts(d.storage_kind(), vga::C_GREEN);
+                    vga::term_puts("   vendor=", vga::C_DIM);
+                    vga::term_puthex8((d.vendor_id >> 8) as u8, vga::C_ORANGE);
+                    vga::term_puthex8(d.vendor_id as u8, vga::C_ORANGE);
+                    vga::term_puts(" device=", vga::C_DIM);
+                    vga::term_puthex8((d.device_id >> 8) as u8, vga::C_ORANGE);
+                    vga::term_puthex8(d.device_id as u8, vga::C_ORANGE);
+                    vga::term_puts("\n", 0);
+                }
+            });
+            if count == 0 {
+                vga::term_puts("  (no storage controllers found)\n", vga::C_DIM);
+            } else {
+                vga::term_puts("Install-to-disk is not implemented yet —\n", vga::C_DIM);
+                vga::term_puts("this is a live ISO. Boot from disk requires a\n", vga::C_DIM);
+                vga::term_puts("future write-driver release.\n", vga::C_DIM);
+            }
         }
         "/sysinfo" => {
             vga::term_puts("MatrixOS v4.0\n", vga::C_CYAN);
@@ -316,6 +348,118 @@ fn handle_slash_command(
         }
         _ => {
             vga::term_puts("unknown command. try /help\n", vga::C_RED);
+        }
+    }
+}
+
+// ── AI tool-call executor ────────────────────────────────────────────────────
+//
+// The chat AI may embed actions in its reply like:
+//   <<TOOL: set max_chat=320>>
+//   <<TOOL: run hello>>
+//   <<TOOL: clear>>
+// After streaming, we scan the response, parse the tool calls, and execute.
+// Returns the number of tool calls fired.
+
+fn execute_tool_calls(
+    response: &str,
+    registry: &mut apps::Registry,
+    max_new_chat: &mut usize,
+    max_new_code: &mut usize,
+    auto_pick:    &mut bool,
+) -> u32 {
+    let bytes = response.as_bytes();
+    let mut i = 0usize;
+    let mut count = 0u32;
+    while i + 8 <= bytes.len() {
+        if &bytes[i..i+8] == b"<<TOOL: " {
+            // Find the matching ">>"
+            let start = i + 8;
+            let mut end = start;
+            while end + 1 < bytes.len() && !(bytes[end] == b'>' && bytes[end+1] == b'>') {
+                end += 1;
+            }
+            if end + 1 < bytes.len() {
+                let inner = core::str::from_utf8(&bytes[start..end]).unwrap_or("");
+                run_one_tool(inner.trim(), registry, max_new_chat, max_new_code, auto_pick);
+                count += 1;
+                i = end + 2;
+                continue;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+fn run_one_tool(
+    inner: &str,
+    registry: &mut apps::Registry,
+    max_new_chat: &mut usize,
+    max_new_code: &mut usize,
+    auto_pick:    &mut bool,
+) {
+    let (verb, arg) = match inner.find(char::is_whitespace) {
+        Some(i) => (&inner[..i], inner[i..].trim_start()),
+        None    => (inner, ""),
+    };
+    vga::term_puts("\n[tool] ", vga::C_DIM);
+    match verb {
+        "set" => {
+            // Format: set key=value
+            if let Some(eq) = arg.find('=') {
+                let key = arg[..eq].trim();
+                let val = arg[eq+1..].trim();
+                match key {
+                    "max_chat" => {
+                        if let Some(n) = parse_u32_safe(val) {
+                            *max_new_chat = (n as usize).clamp(32, 512);
+                            vga::term_puts("set max_chat=", vga::C_GREEN);
+                            vga::term_putu32(*max_new_chat as u32, vga::C_ORANGE);
+                        }
+                    }
+                    "max_code" => {
+                        if let Some(n) = parse_u32_safe(val) {
+                            *max_new_code = (n as usize).clamp(32, 640);
+                            vga::term_puts("set max_code=", vga::C_GREEN);
+                            vga::term_putu32(*max_new_code as u32, vga::C_ORANGE);
+                        }
+                    }
+                    "auto" => {
+                        *auto_pick = matches!(val, "on" | "ON" | "true" | "1");
+                        vga::term_puts("set auto=", vga::C_GREEN);
+                        vga::term_puts(if *auto_pick {"on"} else {"off"}, vga::C_GREEN);
+                    }
+                    _ => { vga::term_puts("unknown key", vga::C_RED); }
+                }
+            } else { vga::term_puts("set: expected key=value", vga::C_RED); }
+        }
+        "run" => {
+            if let Some(app) = registry.find(arg) {
+                let app = app.clone();
+                let ctx = apps::RuntimeCtx {
+                    total_tokens: 0, tsc: math::rdtsc(),
+                    nic: "", usb: "",
+                    model_name: "", d_model: 0, n_layers: 0,
+                };
+                vga::term_puts("running ", vga::C_GREEN);
+                vga::term_puts(&app.name, vga::C_GREEN);
+                vga::term_puts(":\n", 0);
+                apps::run_recipe(&app.recipe, &ctx);
+            } else {
+                vga::term_puts("no such app: ", vga::C_RED);
+                vga::term_puts(arg, vga::C_RED);
+            }
+        }
+        "clear" => {
+            vga::clear_chat();
+            vga::term_puts("cleared\n", vga::C_GREEN);
+        }
+        _ => {
+            vga::term_puts("unknown tool: ", vga::C_RED);
+            vga::term_puts(verb, vga::C_RED);
         }
     }
 }
@@ -948,6 +1092,9 @@ pub extern "C" fn _start() -> ! {
         let mut tok_buf = [0u8; 32];
         let mut turn_tokens: u32 = 0;
 
+        // Buffer the full response for post-processing tool calls.
+        let mut response_buf: alloc::string::String = alloc::string::String::new();
+
         // TSC-based timing — rough tok/s estimate (assumes ~3 GHz CPU)
         let tsc_start = math::rdtsc();
 
@@ -968,6 +1115,7 @@ pub extern "C" fn _start() -> ! {
                         let n = tokenizer::decode_token_to_buf(s, &mut tok_buf);
                         for i in 0..n {
                             vga::term_putc(tok_buf[i], ai_color);
+                            response_buf.push(tok_buf[i] as char);
                         }
                     }
                 } else {
@@ -979,6 +1127,22 @@ pub extern "C" fn _start() -> ! {
                 }
             },
         );
+
+        // ── Tool-call post-processor ──────────────────────────────────────
+        // The chat AI can include <<TOOL: ...>> markers in its reply.  Now
+        // that streaming is done, scan the buffer for them and execute.
+        let n_tools = execute_tool_calls(
+            &response_buf,
+            &mut registry,
+            &mut max_new_chat,
+            &mut max_new_code,
+            &mut auto_pick,
+        );
+        if n_tools > 0 {
+            vga::term_puts("\n[", vga::C_DIM);
+            vga::term_putu32(n_tools, vga::C_GREEN);
+            vga::term_puts(" tool call(s) executed]", vga::C_DIM);
+        }
 
         // Compute approximate tok/s: Δtsc / 3_000_000_000 ≈ seconds elapsed
         let tsc_end  = math::rdtsc();

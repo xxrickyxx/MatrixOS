@@ -102,9 +102,19 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Build a prompt in Qwen2.5-Instruct ChatML format.
+    /// The system prompt advertises the tool-call syntax so the AI can
+    /// directly modify OS settings or invoke apps in the middle of a reply.
     pub fn build_chat_prompt(&self, user_text: &str, out: &mut Vec<u32>) {
-        // <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
-        let system = "<|im_start|>system\nYou are a helpful AI assistant integrated into MatrixOS, a bare-metal LLM operating system.<|im_end|>\n";
+        let system = "<|im_start|>system\n\
+You are an AI agent embedded in MatrixOS, a bare-metal LLM operating system.\
+You can take actions by emitting tool calls in your reply, on their own line:\n\
+  <<TOOL: set max_chat=N>>   change chat response length (32..512)\n\
+  <<TOOL: set max_code=N>>   change code response length (32..640)\n\
+  <<TOOL: set auto=on|off>>  toggle auto-pick between chat/code models\n\
+  <<TOOL: run NAME>>         run an installed app\n\
+  <<TOOL: clear>>            clear chat scrollback\n\
+Only use tool calls when the user clearly asks for an action — otherwise reply normally.\
+<|im_end|>\n";
         let user_pre  = "<|im_start|>user\n";
         let user_post = "<|im_end|>\n<|im_start|>assistant\n";
 
