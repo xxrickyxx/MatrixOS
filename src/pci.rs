@@ -55,6 +55,67 @@ impl PciDevice {
     /// Returns true if this device is a network controller (PCI class 0x02).
     pub fn is_network(&self) -> bool { self.class_code == 0x02 }
 
+    /// Returns true if this device is a USB controller
+    /// (PCI class 0x0C = Serial Bus Controller, subclass 0x03 = USB).
+    pub fn is_usb(&self) -> bool { self.class_code == 0x0C && self.subclass == 0x03 }
+
+    /// Returns true if this device is a display controller / GPU
+    /// (PCI class 0x03 = VGA-compatible / 3D / display controller).
+    pub fn is_gpu(&self) -> bool { self.class_code == 0x03 }
+
+    /// Returns true if this device is a mass-storage controller
+    /// (PCI class 0x01 — IDE/SATA/NVMe/SCSI). Useful for disk-install probing.
+    pub fn is_storage(&self) -> bool { self.class_code == 0x01 }
+
+    /// Best-effort GPU model name based on vendor + device ID.
+    pub fn gpu_model(&self) -> &'static str {
+        match (self.vendor_id, self.device_id) {
+            (0x10DE, _) => "NVIDIA GPU",
+            (0x1002, _) => "AMD/ATI GPU",
+            (0x8086, 0x1234) => "QEMU VGA",
+            (0x8086, _) => "Intel GPU",
+            (0x1234, 0x1111) => "QEMU std-VGA",
+            (0x15AD, _) => "VMware SVGA",
+            (0x80EE, _) => "VirtualBox VGA",
+            (0x1AF4, _) => "Virtio GPU",
+            _ => "Display ctrl",
+        }
+    }
+
+    /// Storage controller subclass name.
+    pub fn storage_kind(&self) -> &'static str {
+        match self.subclass {
+            0x00 => "SCSI",
+            0x01 => "IDE",
+            0x02 => "Floppy",
+            0x03 => "IPI",
+            0x04 => "RAID",
+            0x05 => "ATA",
+            0x06 => "SATA",
+            0x07 => "SAS",
+            0x08 => "NVMe",
+            _    => "Storage",
+        }
+    }
+
+    /// USB controller variant from prog_if:
+    ///   0x00 = UHCI (USB 1.x)
+    ///   0x10 = OHCI (USB 1.x)
+    ///   0x20 = EHCI (USB 2.0)
+    ///   0x30 = xHCI (USB 3.x)
+    ///   0xFE = device, 0xFF = device w/ no interface
+    pub fn usb_kind(&self) -> &'static str {
+        match self.prog_if {
+            0x00 => "UHCI (USB 1.x)",
+            0x10 => "OHCI (USB 1.x)",
+            0x20 => "EHCI (USB 2.0)",
+            0x30 => "xHCI (USB 3.x)",
+            0x80 => "USB (unspec)",
+            0xFE => "USB device",
+            _    => "USB ctrl",
+        }
+    }
+
     /// Best-effort vendor name for the most common emulated NICs.
     pub fn vendor_name(&self) -> &'static str {
         match self.vendor_id {
@@ -212,20 +273,54 @@ pub struct PciSummary {
     pub nic_count:     u32,
     pub first_nic:     Option<PciDevice>,
     pub nic_mac:       [u8; 6],
+    pub usb_count:     u32,
+    pub first_usb:     Option<PciDevice>,
+    pub gpu_count:     u32,
+    pub first_gpu:     Option<PciDevice>,
+    pub storage_count: u32,
+    pub first_storage: Option<PciDevice>,
 }
 
-/// Scan the bus and return aggregate counts + the first NIC found.
+/// Scan the bus and return aggregate counts + the first NIC + first USB controller.
 /// Also attempts to read the NIC's MAC address for Intel e1000 via HHDM-mapped MMIO.
 /// Pass 0 for `hhdm_offset` to skip the MAC read (boot-safe fallback).
 pub fn probe_summary(hhdm_offset: u64) -> PciSummary {
     let mut total = 0u32;
     let mut nics  = 0u32;
-    let mut first_nic: Option<PciDevice> = None;
+    let mut usbs  = 0u32;
+    let mut gpus  = 0u32;
+    let mut storages = 0u32;
+    let mut first_nic:     Option<PciDevice> = None;
+    let mut first_usb:     Option<PciDevice> = None;
+    let mut first_gpu:     Option<PciDevice> = None;
+    let mut first_storage: Option<PciDevice> = None;
     enumerate(|d| {
         total += 1;
         if d.is_network() {
             nics += 1;
             if first_nic.is_none() { first_nic = Some(d); }
+        }
+        if d.is_usb() {
+            usbs += 1;
+            // Prefer xHCI > EHCI > OHCI > UHCI for the "first" slot.
+            let better = match first_usb {
+                None => true,
+                Some(ref cur) => d.prog_if > cur.prog_if,
+            };
+            if better { first_usb = Some(d); }
+        }
+        if d.is_gpu() {
+            gpus += 1;
+            if first_gpu.is_none() { first_gpu = Some(d); }
+        }
+        if d.is_storage() {
+            storages += 1;
+            // Prefer NVMe (0x08) > SATA (0x06) > IDE (0x01)
+            let better = match first_storage {
+                None => true,
+                Some(ref cur) => d.subclass > cur.subclass,
+            };
+            if better { first_storage = Some(d); }
         }
     });
     let nic_mac = if let Some(ref n) = first_nic {
@@ -234,5 +329,11 @@ pub fn probe_summary(hhdm_offset: u64) -> PciSummary {
             _ => [0u8; 6],
         }
     } else { [0u8; 6] };
-    PciSummary { total_devices: total, nic_count: nics, first_nic, nic_mac }
+    PciSummary {
+        total_devices: total,
+        nic_count: nics, first_nic, nic_mac,
+        usb_count: usbs, first_usb,
+        gpu_count: gpus, first_gpu,
+        storage_count: storages, first_storage,
+    }
 }

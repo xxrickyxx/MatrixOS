@@ -16,6 +16,7 @@ pub mod quant;
 pub mod bundle;
 pub mod intent;
 pub mod pci;
+pub mod apps;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -178,6 +179,157 @@ unsafe fn stage_marker(fb: *mut u8, pitch: usize, bpp: usize, fb_w: usize,
     }
 }
 
+// ── Slash-command dispatcher ─────────────────────────────────────────────────
+
+fn handle_slash_command(
+    line: &str,
+    registry: &mut apps::Registry,
+    max_new_chat: &mut usize,
+    max_new_code: &mut usize,
+    auto_pick: &mut bool,
+    total_tokens: u32,
+    tsc: u64,
+    nic: &str, usb: &str, gpu: &str, storage: &str,
+    model_name: &str,
+    d_model: u32, n_layers: u32,
+) {
+    let line = line.trim();
+    // Split into command + argument.
+    let (cmd, arg) = match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim_start()),
+        None    => (line, ""),
+    };
+
+    match cmd {
+        "/help" | "/?" => {
+            vga::term_puts("Commands:\n", vga::C_CYAN);
+            vga::term_puts("  /help              this list\n", vga::C_DIM);
+            vga::term_puts("  /apps              list installed apps\n", vga::C_DIM);
+            vga::term_puts("  /run <name>        execute an app\n", vga::C_DIM);
+            vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
+            vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
+            vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
+            vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
+            vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
+            vga::term_puts("Hotkeys: F1 chat · F2 code · TAB toggle auto · F5 clear\n", vga::C_DIM);
+        }
+        "/apps" => {
+            let list = registry.list();
+            vga::term_puts("Installed apps:\n", vga::C_CYAN);
+            if list.is_empty() {
+                vga::term_puts("  (none)\n", vga::C_DIM);
+            }
+            for a in list {
+                vga::term_puts("  ", 0);
+                vga::term_puts(&a.name, vga::C_GREEN);
+                vga::term_puts("   [", vga::C_DIM);
+                vga::term_puts(a.author.label(), vga::C_DIM);
+                vga::term_puts(", ", vga::C_DIM);
+                vga::term_putu32(a.recipe.len() as u32, vga::C_DIM);
+                vga::term_puts(" cmds]\n", vga::C_DIM);
+            }
+        }
+        "/run" => {
+            if arg.is_empty() {
+                vga::term_puts("usage: /run <app-name>\n", vga::C_RED);
+                return;
+            }
+            let app = match registry.find(arg) {
+                Some(a) => a.clone(),
+                None => {
+                    vga::term_puts("app not found: ", vga::C_RED);
+                    vga::term_puts(arg, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                    return;
+                }
+            };
+            let ctx = apps::RuntimeCtx {
+                total_tokens, tsc,
+                nic, usb,
+                model_name, d_model, n_layers,
+            };
+            vga::term_puts("--- running ", vga::C_DIM);
+            vga::term_puts(&app.name, vga::C_GREEN);
+            vga::term_puts(" ---\n", vga::C_DIM);
+            apps::run_recipe(&app.recipe, &ctx);
+            vga::term_puts("--- end ---\n", vga::C_DIM);
+            // Silence unused-warning for the resources we may add later.
+            let _ = gpu; let _ = storage;
+        }
+        "/sysinfo" => {
+            vga::term_puts("MatrixOS v4.0\n", vga::C_CYAN);
+            vga::term_puts("  model:   ", vga::C_DIM); vga::term_puts(model_name, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  d_model: ", vga::C_DIM); vga::term_putu32(d_model, vga::C_ORANGE); vga::term_puts("\n", 0);
+            vga::term_puts("  layers:  ", vga::C_DIM); vga::term_putu32(n_layers, vga::C_ORANGE); vga::term_puts("\n", 0);
+            vga::term_puts("  tokens:  ", vga::C_DIM); vga::term_putu32(total_tokens, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  NIC:     ", vga::C_DIM); vga::term_puts(nic, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  USB:     ", vga::C_DIM); vga::term_puts(usb, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  GPU:     ", vga::C_DIM); vga::term_puts(gpu, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  Storage: ", vga::C_DIM); vga::term_puts(storage, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  max_chat=", vga::C_DIM); vga::term_putu32(*max_new_chat as u32, vga::C_ORANGE);
+            vga::term_puts(" max_code=", vga::C_DIM); vga::term_putu32(*max_new_code as u32, vga::C_ORANGE);
+            vga::term_puts(" auto=", vga::C_DIM); vga::term_puts(if *auto_pick {"on"} else {"off"}, vga::C_GREEN);
+            vga::term_puts("\n", 0);
+        }
+        "/set" => {
+            // Format: /set key=value
+            if let Some(eq) = arg.find('=') {
+                let key = arg[..eq].trim();
+                let val = arg[eq+1..].trim();
+                match key {
+                    "max_chat" => {
+                        if let Some(n) = parse_u32_safe(val) {
+                            let clamped = n.clamp(32, 512) as usize;
+                            *max_new_chat = clamped;
+                            vga::term_puts("[set] max_chat=", vga::C_GREEN);
+                            vga::term_putu32(clamped as u32, vga::C_ORANGE);
+                            vga::term_puts("\n", 0);
+                        } else { vga::term_puts("bad number\n", vga::C_RED); }
+                    }
+                    "max_code" => {
+                        if let Some(n) = parse_u32_safe(val) {
+                            let clamped = n.clamp(32, 640) as usize;
+                            *max_new_code = clamped;
+                            vga::term_puts("[set] max_code=", vga::C_GREEN);
+                            vga::term_putu32(clamped as u32, vga::C_ORANGE);
+                            vga::term_puts("\n", 0);
+                        } else { vga::term_puts("bad number\n", vga::C_RED); }
+                    }
+                    "auto" => {
+                        let on = matches!(val, "on" | "ON" | "true" | "1");
+                        *auto_pick = on;
+                        vga::term_puts("[set] auto=", vga::C_GREEN);
+                        vga::term_puts(if on {"on"} else {"off"}, vga::C_GREEN);
+                        vga::term_puts("\n", 0);
+                    }
+                    _ => {
+                        vga::term_puts("unknown key (max_chat/max_code/auto)\n", vga::C_RED);
+                    }
+                }
+            } else {
+                vga::term_puts("usage: /set key=value\n", vga::C_RED);
+            }
+        }
+        "/clear" => {
+            vga::clear_chat();
+        }
+        _ => {
+            vga::term_puts("unknown command. try /help\n", vga::C_RED);
+        }
+    }
+}
+
+fn parse_u32_safe(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let mut n: u32 = 0;
+    for b in s.bytes() {
+        if !(b'0'..=b'9').contains(&b) { return None; }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(n)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -274,6 +426,8 @@ pub extern "C" fn _start() -> ! {
     vga::term_putu32(pci.total_devices, vga::C_ORANGE);
     vga::term_puts(", NICs: ", vga::C_GREEN);
     vga::term_putu32(pci.nic_count, vga::C_ORANGE);
+    vga::term_puts(", USB: ", vga::C_GREEN);
+    vga::term_putu32(pci.usb_count, vga::C_ORANGE);
     vga::term_puts("\n", 0);
     let nic_label: &str = if let Some(n) = pci.first_nic {
         let label = n.nic_model();
@@ -289,6 +443,35 @@ pub extern "C" fn _start() -> ! {
             }
         }
         vga::term_puts("\n", 0);
+        label
+    } else {
+        "none"
+    };
+    let usb_label: &str = if let Some(u) = pci.first_usb {
+        let label = u.usb_kind();
+        vga::term_puts("[OK] USB: ", vga::C_GREEN);
+        vga::term_puts(label, vga::C_CYAN);
+        vga::term_puts("\n", 0);
+        label
+    } else {
+        "none"
+    };
+    let gpu_label: &str = if let Some(g) = pci.first_gpu {
+        let label = g.gpu_model();
+        vga::term_puts("[OK] GPU: ", vga::C_GREEN);
+        vga::term_puts(label, vga::C_CYAN);
+        vga::term_puts("\n", 0);
+        label
+    } else {
+        "none"
+    };
+    let storage_label: &str = if let Some(s) = pci.first_storage {
+        let label = s.storage_kind();
+        vga::term_puts("[OK] Storage: ", vga::C_GREEN);
+        vga::term_puts(label, vga::C_CYAN);
+        vga::term_puts(" (count=", vga::C_DIM);
+        vga::term_putu32(pci.storage_count, vga::C_ORANGE);
+        vga::term_puts(")\n", vga::C_DIM);
         label
     } else {
         "none"
@@ -422,20 +605,31 @@ pub extern "C" fn _start() -> ! {
         vocab:       chat_tok.as_ref().map(|t| t.count as u32).unwrap_or(chat_cfg.vocab_size as u32),
         chat_name:   chat_display,
         code_name:   code_display,
-        active_slot: 0,
-        nic_info:    nic_label,
+        active_slot:  0,
+        nic_info:     nic_label,
+        usb_info:     usb_label,
+        gpu_info:     gpu_label,
+        storage_info: storage_label,
     };
     vga::init_gui(&sidebar);
 
     vga::term_puts("Welcome to MatrixOS — Dual-Model AI\n", vga::C_CYAN);
-    vga::term_puts("F1 chat · F2 code · TAB auto-pick\n", vga::C_DIM);
-    vga::term_puts("F5 clear chat · type and ENTER\n\n", vga::C_DIM);
+    vga::term_puts("F1 chat · F2 code · TAB auto-pick · F5 clear\n", vga::C_DIM);
+    vga::term_puts("Slash commands: /help /apps /run <name> /sysinfo\n\n", vga::C_DIM);
 
     // ── Stage 8: REPL ─────────────────────────────────────────────────────
     let mut kb       = keyboard::Keyboard::new();
     let mut buf      = [0u8; 256];
     let mut total_tokens: u32 = 0;
     let mut auto_pick = true;   // TAB toggles
+
+    // ── App registry (built-ins + AI-generated) ───────────────────────────
+    let mut registry = apps::Registry::new();
+    registry.install_builtins();
+
+    // ── Settings the AI agents are allowed to change ──────────────────────
+    let mut max_new_chat: usize = 192;   // generous; user wanted longer chats
+    let mut max_new_code: usize = 320;
 
     loop {
         vga::term_puts("USER: ", vga::C_USER);
@@ -483,6 +677,26 @@ pub extern "C" fn _start() -> ! {
         // Echo user line
         for i in 0..len { vga::term_putc(buf[i], vga::C_TEXT); }
         vga::term_putc(b'\n', 0);
+
+        // ── Slash commands: handled in-kernel, no AI involved ─────────────
+        if buf[0] == b'/' {
+            let cmd_line = core::str::from_utf8(&buf[..len]).unwrap_or("/");
+            handle_slash_command(
+                cmd_line,
+                &mut registry,
+                &mut max_new_chat,
+                &mut max_new_code,
+                &mut auto_pick,
+                total_tokens,
+                math::rdtsc(),
+                nic_label, usb_label, gpu_label, storage_label,
+                active_name,
+                active_cfg.d_model as u32,
+                active_cfg.n_layers as u32,
+            );
+            vga::term_puts("\n", 0);
+            continue;
+        }
 
         // Auto-pick: maybe switch slot based on intent before responding
         if auto_pick {
@@ -535,7 +749,8 @@ pub extern "C" fn _start() -> ! {
         // TSC-based timing — rough tok/s estimate (assumes ~3 GHz CPU)
         let tsc_start = math::rdtsc();
 
-        let max_new: usize = if active_slot == 0 { 96 } else { 160 };
+        // User-tunable via /set max_chat=N or /set max_code=N
+        let max_new: usize = if active_slot == 0 { max_new_chat } else { max_new_code };
         model::generate(
             active_gguf,
             &active_cfg,

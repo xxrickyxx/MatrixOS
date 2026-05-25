@@ -259,6 +259,9 @@ pub struct SidebarInfo<'a> {
     pub code_name:     &'a str,
     pub active_slot:   u8,        // 0 = chat, 1 = code
     pub nic_info:      &'a str,
+    pub usb_info:      &'a str,
+    pub gpu_info:      &'a str,
+    pub storage_info:  &'a str,
 }
 
 // Remember screen positions of the model labels so we can repaint just
@@ -399,10 +402,16 @@ pub fn init_gui(info: &SidebarInfo) {
         // ─ SYSTEM ─
         draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
         draw_str_at(sx, sy, "SYSTEM", C_CYAN); sy += 20;
-        draw_str_at(sx, sy, "Heap:  20 MB",  C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "Heap:  32 MB",  C_TEXT); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "ISA:  SSE4.2",  C_TEXT); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "NIC:", C_DIM);
-        draw_str_at(sx + 5*CHAR_W, sy, info.nic_info, C_TEXT); sy += CHAR_H + 8;
+        draw_str_at(sx + 5*CHAR_W, sy, info.nic_info, C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "USB:", C_DIM);
+        draw_str_at(sx + 5*CHAR_W, sy, info.usb_info, C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "GPU:", C_DIM);
+        draw_str_at(sx + 5*CHAR_W, sy, info.gpu_info, C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "Disk:", C_DIM);
+        draw_str_at(sx + 6*CHAR_W, sy, info.storage_info, C_TEXT); sy += CHAR_H + 8;
 
         // ─ CONTROLS ─
         draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
