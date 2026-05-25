@@ -37,6 +37,11 @@ const CODE_KEYWORDS: &[&[u8]] = &[
     b"binary", b"binari",  b"compile", b"compila",
     b"git ",   b"github",  b"commit",
     b"regex",  b"json",    b"xml",  b"yaml",
+    b"browser",  b"web ",   b"http",  b"server",
+    b"client",   b"socket", b"port", b"endpoint",
+    b"api",      b"crud",   b"sql",  b"database",
+    b"package",  b"pacchet", b"lib",  b"library",
+    b"libreria", b"build",   b"make", b"cmake",
 ];
 
 /// Score a prompt and pick a mode.  Returns the chosen mode + the

@@ -463,12 +463,41 @@ pub fn generate<'a, F: FnMut(u32)>(
         pos += 1;
     }
 
+    // ── Sliding-window history for repetition penalty ────────────────────
+    // We track the last RP_WINDOW generated tokens.  Before each argmax we
+    // multiply their logits by (1/RP_PENALTY) (i.e. divide by ~1.18) so the
+    // model is nudged away from looping on the same token / bigram.  This
+    // is cheap, deterministic, and dramatically improves coherence at the
+    // tail of long greedy responses.
+    const RP_WINDOW:  usize = 32;
+    const RP_PENALTY: f32   = 1.18;
+
+    let mut history: [u32; RP_WINDOW] = [u32::MAX; RP_WINDOW];
+    let mut hist_n: usize = 0;
+
     // Generate: logits already valid from the final prompt step
     for _ in 0..max_new {
         if logits.is_empty() || pos >= kv.max_seq { break; }
+
+        // Apply repetition penalty.
+        let n = hist_n.min(RP_WINDOW);
+        for k in 0..n {
+            let id = history[k] as usize;
+            if id < logits.len() {
+                let v = logits[id];
+                logits[id] = if v > 0.0 { v / RP_PENALTY } else { v * RP_PENALTY };
+            }
+        }
+
         let next = argmax(&logits) as u32;
         if next == cfg.eos { break; }
         on_token(next);
+
+        // Record into the sliding window.
+        let slot = hist_n % RP_WINDOW;
+        history[slot] = next;
+        hist_n += 1;
+
         forward(gguf, cfg, kv, next as usize, pos, &mut logits, scratch);
         pos += 1;
     }

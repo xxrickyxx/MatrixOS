@@ -113,6 +113,16 @@ impl<'a> Tokenizer<'a> {
         self.encode(user_text, out);
         self.encode(user_post, out);
     }
+
+    /// Build a prompt with a CUSTOM system message — used for app-generation
+    /// and validator turns where we need a focused system role.
+    pub fn build_prompt_with_system(&self, system_text: &str, user_text: &str, out: &mut Vec<u32>) {
+        self.encode("<|im_start|>system\n", out);
+        self.encode(system_text, out);
+        self.encode("<|im_end|>\n<|im_start|>user\n", out);
+        self.encode(user_text, out);
+        self.encode("<|im_end|>\n<|im_start|>assistant\n", out);
+    }
 }
 
 // ── Token-to-text decoder ─────────────────────────────────────────────────────

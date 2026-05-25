@@ -206,6 +206,7 @@ fn handle_slash_command(
             vga::term_puts("  /help              this list\n", vga::C_DIM);
             vga::term_puts("  /apps              list installed apps\n", vga::C_DIM);
             vga::term_puts("  /run <name>        execute an app\n", vga::C_DIM);
+            vga::term_puts("  /create <name> <desc>   AI builds the app\n", vga::C_DIM);
             vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
             vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
             vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
@@ -319,6 +320,187 @@ fn handle_slash_command(
     }
 }
 
+// ── AI-driven app creation: chat proposes, code validates, loop ─────────────
+
+const APP_GEN_SYSTEM: &str = "\
+You are MatrixOS app generator.  Output ONLY a recipe in MatrixOS DSL, \
+no explanation, no markdown fences.  Available commands (one per line):\n\
+  say <text>      print text (may use $i $tokens $time $nic $usb $model)\n\
+  info            print model + system info\n\
+  time            print current TSC counter\n\
+  tokens          print total tokens generated\n\
+  nic             print NIC label\n\
+  usb             print USB controller label\n\
+  pause <N>       wait N units (0..50)\n\
+  clear           clear chat scrollback\n\
+  loop <N>        begin loop body, N <= 64, exposes $i\n\
+  end             close loop\n\
+Recipe must be 4–20 lines.  No comments, no quotes around the text.";
+
+const APP_FIX_SYSTEM: &str = "\
+You are a strict validator for the MatrixOS DSL.  The user gives you a \
+broken recipe and the parser error.  Output ONLY the fixed recipe with \
+NO explanation.  Use the same commands listed in the original spec.";
+
+/// Run one turn through the given model, capturing the FULL response text.
+/// Stops at EOS or `max_new` tokens.
+fn ai_turn_capture(
+    gguf:    &gguf::Gguf,
+    cfg:     &model::ModelConfig,
+    kv:      &mut model::KVCache,
+    scratch: &mut model::ForwardScratch,
+    tok:     &Option<tokenizer::Tokenizer>,
+    system_text: &str,
+    user_text:   &str,
+    max_new:     usize,
+) -> alloc::string::String {
+    use alloc::string::String;
+    // Reset KV so the new turn starts fresh.
+    for v in kv.k.iter_mut() { *v = 0.0; }
+    for v in kv.v.iter_mut() { *v = 0.0; }
+
+    let mut prompt_tokens: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if let Some(ref t) = *tok {
+        t.build_prompt_with_system(system_text, user_text, &mut prompt_tokens);
+    } else {
+        for &b in user_text.as_bytes() { prompt_tokens.push(b as u32); }
+    }
+
+    let mut out = String::new();
+    let mut tok_buf = [0u8; 32];
+    model::generate(gguf, cfg, kv, scratch, &prompt_tokens, max_new, |id| {
+        if let Some(ref t) = *tok {
+            if let Some(s) = t.get_token(id as usize) {
+                let n = tokenizer::decode_token_to_buf(s, &mut tok_buf);
+                for i in 0..n {
+                    out.push(tok_buf[i] as char);
+                }
+            }
+        }
+    });
+    out
+}
+
+fn try_create_app_via_ai(
+    arg: &str,
+    chat_gguf: &gguf::Gguf, chat_cfg: &model::ModelConfig,
+    chat_kv: &mut model::KVCache, chat_tok: &Option<tokenizer::Tokenizer>,
+    code_gguf: &gguf::Gguf, code_cfg: &model::ModelConfig,
+    code_kv: &mut model::KVCache, code_tok: &Option<tokenizer::Tokenizer>,
+    scratch: &mut model::ForwardScratch,
+    registry: &mut apps::Registry,
+) {
+    use alloc::string::String;
+
+    let arg = arg.trim();
+    if arg.is_empty() {
+        vga::term_puts("usage: /create <name> <description>\n", vga::C_RED);
+        return;
+    }
+    // First word = name, rest = description
+    let (name, desc) = match arg.find(char::is_whitespace) {
+        Some(i) => (&arg[..i], arg[i..].trim_start()),
+        None    => (arg, ""),
+    };
+    if name.is_empty() {
+        vga::term_puts("name required\n", vga::C_RED);
+        return;
+    }
+    if registry.find(name).is_some() {
+        vga::term_puts("name already exists. /delete or pick another.\n", vga::C_RED);
+        return;
+    }
+    if desc.is_empty() {
+        vga::term_puts("description required after name\n", vga::C_RED);
+        return;
+    }
+
+    vga::term_puts("[create] app: ", vga::C_DIM);
+    vga::term_puts(name, vga::C_GREEN);
+    vga::term_puts("\n[create] description: ", vga::C_DIM);
+    vga::term_puts(desc, vga::C_TEXT);
+    vga::term_puts("\n", 0);
+
+    // ── Round 1: chat model emits the initial recipe ─────────────────────
+    vga::term_puts("[round 1] chat-AI proposing recipe...\n", vga::C_CYAN);
+    let mut recipe_text: String = ai_turn_capture(
+        chat_gguf, chat_cfg, chat_kv, scratch, chat_tok,
+        APP_GEN_SYSTEM, desc, 256,
+    );
+    vga::term_puts("[round 1] draft (", vga::C_DIM);
+    vga::term_putu32(recipe_text.len() as u32, vga::C_ORANGE);
+    vga::term_puts(" bytes):\n", vga::C_DIM);
+    for &b in recipe_text.as_bytes().iter().take(400) {
+        vga::term_putc(b, vga::C_DIM);
+    }
+    vga::term_puts("\n", 0);
+
+    // ── Rounds 2..=4: parse; if fail, ask code-AI to fix ─────────────────
+    const MAX_ROUNDS: usize = 4;
+    let mut author = apps::AppAuthor::AiChat;
+    for round in 2..=MAX_ROUNDS {
+        match apps::parse_recipe(&recipe_text) {
+            Ok(cmds) if !cmds.is_empty() => {
+                vga::term_puts("[ok] parsed ", vga::C_GREEN);
+                vga::term_putu32(cmds.len() as u32, vga::C_ORANGE);
+                vga::term_puts(" commands.\n", vga::C_GREEN);
+                let app = apps::App {
+                    name: String::from(name),
+                    recipe: cmds,
+                    author,
+                };
+                match registry.register(app) {
+                    Ok(()) => {
+                        vga::term_puts("[done] app registered. /run ", vga::C_GREEN);
+                        vga::term_puts(name, vga::C_GREEN);
+                        vga::term_puts(" to execute.\n", vga::C_GREEN);
+                    }
+                    Err(e) => {
+                        vga::term_puts("[fail] register: ", vga::C_RED);
+                        vga::term_puts(e, vga::C_RED);
+                        vga::term_puts("\n", 0);
+                    }
+                }
+                return;
+            }
+            Ok(_) => {
+                vga::term_puts("[warn] empty recipe, asking code-AI to retry\n", vga::C_ORANGE);
+            }
+            Err(e) => {
+                vga::term_puts("[parse-error] line ", vga::C_RED);
+                vga::term_putu32(e.line as u32, vga::C_RED);
+                vga::term_puts(": ", vga::C_RED);
+                vga::term_puts(e.msg, vga::C_RED);
+                vga::term_puts("\n", 0);
+            }
+        }
+
+        // Hand off to code-AI for a fix.
+        vga::term_puts("[round ", vga::C_CYAN);
+        vga::term_putu32(round as u32, vga::C_CYAN);
+        vga::term_puts("] code-AI fixing...\n", vga::C_CYAN);
+
+        // Compose the validator user-message.
+        let mut fix_user = String::from("Broken recipe:\n");
+        fix_user.push_str(&recipe_text);
+        fix_user.push_str("\n\nRewrite the recipe correctly using only the listed commands.");
+
+        recipe_text = ai_turn_capture(
+            code_gguf, code_cfg, code_kv, scratch, code_tok,
+            APP_FIX_SYSTEM, &fix_user, 320,
+        );
+        author = apps::AppAuthor::AiCode;
+        vga::term_puts("[round ", vga::C_DIM);
+        vga::term_putu32(round as u32, vga::C_DIM);
+        vga::term_puts("] fix proposed (", vga::C_DIM);
+        vga::term_putu32(recipe_text.len() as u32, vga::C_ORANGE);
+        vga::term_puts(" bytes)\n", vga::C_DIM);
+    }
+
+    vga::term_puts("[give-up] could not produce a valid recipe in 4 rounds.\n", vga::C_RED);
+    vga::term_puts("Try a simpler description, or write the recipe yourself.\n", vga::C_DIM);
+}
+
 fn parse_u32_safe(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.is_empty() { return None; }
@@ -399,12 +581,7 @@ pub extern "C" fn _start() -> ! {
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
-    // ── Stage 2: heap ───────────────────────────────────────────────────
-    allocator::init();
-    vga::term_puts("[OK] Heap online (64 MB)\n", vga::C_GREEN);
-    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 5, 0x80, 0x80, 0xFF); }
-
-    // ── Stage 3: HHDM ───────────────────────────────────────────────────
+    // ── Stage 2: HHDM (needed before heap alloc from memmap) ─────────────
     let hhdm_offset: u64 = match HHDM_REQUEST.response() {
         Some(r) => {
             vga::term_puts("[OK] HHDM mapped\n", vga::C_GREEN);
@@ -415,6 +592,14 @@ pub extern "C" fn _start() -> ! {
             0
         }
     };
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 5, 0x80, 0x80, 0xFF); }
+
+    // ── Stage 3: heap (allocate from Limine memmap, NOT static BSS) ─────
+    allocator::init_with_memmap(hhdm_offset);
+    let heap_mb = unsafe { allocator::HEAP_BYTES / (1024 * 1024) };
+    vga::term_puts("[OK] Heap online (", vga::C_GREEN);
+    vga::term_putu32(heap_mb as u32, vga::C_ORANGE);
+    vga::term_puts(" MB from memmap)\n", vga::C_GREEN);
 
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 6, 0x40, 0xFF, 0x80); }
 
@@ -550,7 +735,10 @@ pub extern "C" fn _start() -> ! {
     let code_tok = tokenizer::Tokenizer::from_gguf(&code_gguf);
 
     // ── Stage 6: Allocate KV caches + shared scratch ────────────────────
-    const MAX_SEQ: usize = 128;
+    // Bumped 128 → 512: at 128 tokens the response had to fit in ~80 tokens
+    // after the prompt template, which forced ultra-short answers.  Memmap
+    // heap means we have GBs of RAM to play with.
+    const MAX_SEQ: usize = 512;
     vga::term_puts("[..] Allocating KV caches...\n", vga::C_CYAN);
     let mut chat_kv = model::KVCache::new(chat_cfg.n_layers, chat_cfg.n_kv_heads,
                                           chat_cfg.head_dim, MAX_SEQ);
@@ -677,6 +865,20 @@ pub extern "C" fn _start() -> ! {
         // Echo user line
         for i in 0..len { vga::term_putc(buf[i], vga::C_TEXT); }
         vga::term_putc(b'\n', 0);
+
+        // ── /create <name> <description>: AI-built app with code-validator ─
+        if len > 8 && &buf[..8] == b"/create " {
+            let arg = core::str::from_utf8(&buf[8..len]).unwrap_or("");
+            try_create_app_via_ai(
+                arg,
+                &chat_gguf, &chat_cfg, &mut chat_kv, &chat_tok,
+                &code_gguf, &code_cfg, &mut code_kv, &code_tok,
+                &mut scratch,
+                &mut registry,
+            );
+            vga::term_puts("\n", 0);
+            continue;
+        }
 
         // ── Slash commands: handled in-kernel, no AI involved ─────────────
         if buf[0] == b'/' {
