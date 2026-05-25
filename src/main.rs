@@ -50,39 +50,39 @@ fn delay() {
     for _ in 0..500_000 { unsafe { core::arch::asm!("nop"); } }
 }
 
-// ── Keyboard line reader ──────────────────────────────────────────────────────
+// ── GUI-aware keyboard line reader ────────────────────────────────────────────
 
-/// Blocking read of one line (up to `max` chars); echoes each char.
-/// Returns number of bytes written into `buf`.
-fn read_line(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
+/// Blocking read into `buf` with live GUI input-box rendering.
+/// Returns number of bytes typed (without the newline).
+fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
     let mut len = 0usize;
+    vga::draw_input_line(buf, len);   // show empty box + cursor initially
+
     loop {
-        // Poll keyboard (busy-wait)
         let sc = loop {
             if let Some(s) = kb.read_scancode() { break s; }
             unsafe { core::arch::asm!("pause"); }
         };
 
-        // Ignore key-release (high bit set in basic scan set)
-        if sc & 0x80 != 0 { continue; }
+        if sc & 0x80 != 0 { continue; }   // ignore key-release events
 
         if let Some(ch) = kb.scancode_to_char(sc) {
             match ch {
                 '\n' => {
-                    vga::term_putc(b'\n', 0xFFFFFF);
+                    vga::draw_input_line(&[], 0);   // clear input box
                     break;
                 }
                 '\x08' => {
                     if len > 0 {
                         len -= 1;
-                        vga::term_putc(b'\x08', 0xFFFFFF);
+                        vga::draw_input_line(buf, len);
                     }
                 }
                 c => {
                     if len < buf.len() - 1 {
                         buf[len] = c as u8;
                         len += 1;
-                        vga::term_putc(c as u8, 0xFFFFFF);
+                        vga::draw_input_line(buf, len);
                     }
                 }
             }
@@ -117,46 +117,47 @@ pub extern "C" fn _start() -> ! {
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
+    // Init terminal to full-screen for the boot log
     vga::init_terminal(fb_ptr, pitch, bpp, fb_w, fb_h);
     delay();
 
-    vga::term_puts("MATRIXOS v3.0  --  BARE-METAL LLM OS\n", 0x00FF41);
-    vga::term_puts("Boot sequence starting...\n", 0x888888);
+    vga::term_puts("MATRIXOS v3.0  --  BARE-METAL LLM OS\n", vga::C_GREEN);
+    vga::term_puts("Boot sequence starting...\n", vga::C_DIM);
 
     // ── Stage 1: hardware ────────────────────────────────────────────────
     unsafe { enable_sse(); core::arch::asm!("cli"); }
-    vga::term_puts("[OK] SSE/AVX enabled\n", 0x00FF41);
+    vga::term_puts("[OK] SSE/AVX enabled\n", vga::C_GREEN);
 
     unsafe { idt::init(); }
-    vga::term_puts("[OK] IDT loaded\n", 0x00FF41);
+    vga::term_puts("[OK] IDT loaded\n", vga::C_GREEN);
 
     if !BASE_REVISION.is_supported() {
-        vga::term_puts("[FATAL] Limine revision not supported\n", 0xFF0000);
+        vga::term_puts("[FATAL] Limine revision not supported\n", vga::C_RED);
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
     // ── Stage 2: heap ───────────────────────────────────────────────────
     allocator::init();
-    vga::term_puts("[OK] Heap online (20 MB)\n", 0x00FF41);
+    vga::term_puts("[OK] Heap online (20 MB)\n", vga::C_GREEN);
 
     // ── Stage 3: HHDM ───────────────────────────────────────────────────
     match HHDM_REQUEST.response() {
-        Some(_) => vga::term_puts("[OK] HHDM mapped\n", 0x00FF41),
-        None    => vga::term_puts("[WARN] HHDM unavailable\n", 0xFFAA00),
+        Some(_) => vga::term_puts("[OK] HHDM mapped\n", vga::C_GREEN),
+        None    => vga::term_puts("[WARN] HHDM unavailable\n", vga::C_ORANGE),
     };
 
     // ── Stage 4: GGUF module ─────────────────────────────────────────────
-    vga::term_puts("[..] Loading GGUF module...\n", 0x00FFFF);
+    vga::term_puts("[..] Loading GGUF module...\n", vga::C_CYAN);
 
     let gguf_data: &[u8] = match MODULE_REQUEST.response() {
         None => {
-            vga::term_puts("[FATAL] No module request response\n", 0xFF0000);
+            vga::term_puts("[FATAL] No module request response\n", vga::C_RED);
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
         Some(res) => {
             let mods = res.modules();
             if mods.is_empty() {
-                vga::term_puts("[FATAL] No module in ISO\n", 0xFF0000);
+                vga::term_puts("[FATAL] No module in ISO\n", vga::C_RED);
                 loop { unsafe { core::arch::asm!("hlt"); } }
             }
             let m = &mods[0];
@@ -166,77 +167,98 @@ pub extern "C" fn _start() -> ! {
 
     // Verify GGUF magic
     if gguf_data.len() < 4 || &gguf_data[0..4] != b"GGUF" {
-        vga::term_puts("[FATAL] Not a valid GGUF file\n", 0xFF0000);
+        vga::term_puts("[FATAL] Not a valid GGUF file\n", vga::C_RED);
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
     let gguf = match gguf::Gguf::new(gguf_data) {
-        None    => { vga::term_puts("[FATAL] GGUF parse failed\n", 0xFF0000); loop { unsafe { core::arch::asm!("hlt"); } } }
+        None    => { vga::term_puts("[FATAL] GGUF parse failed\n", vga::C_RED); loop { unsafe { core::arch::asm!("hlt"); } } }
         Some(g) => g,
     };
 
-    vga::term_puts("[OK] GGUF parsed. Tensors: ", 0x00FF41);
-    vga::term_putu32(gguf.header.tensor_count as u32, 0xFFFF00);
+    vga::term_puts("[OK] GGUF parsed. Tensors: ", vga::C_GREEN);
+    vga::term_putu32(gguf.header.tensor_count as u32, vga::C_ORANGE);
     vga::term_puts("\n", 0);
-
-    if let Some(gguf::GgufValue::String(name)) = gguf.find_metadata("general.name") {
-        vga::term_puts("[OK] Model: ", 0x00FF41);
-        vga::term_puts(name, 0xFFFF00);
-        vga::term_puts("\n", 0);
-    }
 
     // ── Stage 5: Load config + tokenizer ─────────────────────────────────
     let cfg = model::load_config_from_gguf(&gguf);
-    vga::term_puts("[OK] Config loaded. d_model=", 0x00FF41);
-    vga::term_putu32(cfg.d_model as u32, 0xFFFF00);
-    vga::term_puts(" layers=", 0x00FF41);
-    vga::term_putu32(cfg.n_layers as u32, 0xFFFF00);
+    vga::term_puts("[OK] Config: d_model=", vga::C_GREEN);
+    vga::term_putu32(cfg.d_model as u32, vga::C_ORANGE);
+    vga::term_puts(" layers=", vga::C_GREEN);
+    vga::term_putu32(cfg.n_layers as u32, vga::C_ORANGE);
     vga::term_puts("\n", 0);
 
     let tokenizer = match tokenizer::Tokenizer::from_gguf(&gguf) {
-        None    => { vga::term_puts("[WARN] Tokenizer not found in GGUF\n", 0xFFAA00); None }
+        None    => { vga::term_puts("[WARN] Tokenizer not found\n", vga::C_ORANGE); None }
         Some(t) => {
-            vga::term_puts("[OK] Tokenizer loaded. Vocab=", 0x00FF41);
-            vga::term_putu32(t.count as u32, 0xFFFF00);
+            vga::term_puts("[OK] Tokenizer: vocab=", vga::C_GREEN);
+            vga::term_putu32(t.count as u32, vga::C_ORANGE);
             vga::term_puts("\n", 0);
             Some(t)
         }
     };
 
     // ── Stage 6: Allocate KV cache + scratch ─────────────────────────────
-    const MAX_SEQ: usize = 128; // KV cache ~14 MB; ChatML prompt needs ~40+ slots
+    const MAX_SEQ: usize = 128;
 
-    vga::term_puts("[..] Allocating KV cache...\n", 0x00FFFF);
+    vga::term_puts("[..] Allocating KV cache...\n", vga::C_CYAN);
     let mut kv = model::KVCache::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, MAX_SEQ);
-    vga::term_puts("[OK] KV cache allocated\n", 0x00FF41);
+    vga::term_puts("[OK] KV cache ready\n", vga::C_GREEN);
 
-    vga::term_puts("[..] Allocating scratch buffers...\n", 0x00FFFF);
+    vga::term_puts("[..] Allocating scratch buffers...\n", vga::C_CYAN);
     let mut scratch = model::ForwardScratch::new(&cfg, MAX_SEQ);
-    vga::term_puts("[OK] Scratch ready\n", 0x00FF41);
+    vga::term_puts("[OK] Scratch ready. Launching GUI...\n", vga::C_GREEN);
 
-    // ── Stage 7: Interactive REPL ─────────────────────────────────────────
-    vga::term_puts("\n=== MATRIXOS AI TERMINAL ===\n", 0x00FF41);
-    vga::term_puts("Type your question and press ENTER.\n", 0x888888);
-    vga::term_puts("(Generation may be slow on bare metal)\n\n", 0x888888);
+    // ── Stage 7: Switch to GUI ────────────────────────────────────────────
+    // Gather model name from GGUF (or use default)
+    let model_name: &str = if let Some(gguf::GgufValue::String(n)) = gguf.find_metadata("general.name") {
+        n
+    } else {
+        "Qwen2.5-7B"
+    };
 
+    let vocab_count = tokenizer.as_ref().map(|t| t.count as u32).unwrap_or(cfg.vocab_size as u32);
+
+    let sidebar = vga::SidebarInfo {
+        model_name,
+        quant:     "Q4_K_M",
+        n_tensors: gguf.header.tensor_count as u32,
+        d_model:   cfg.d_model as u32,
+        n_layers:  cfg.n_layers as u32,
+        vocab:     vocab_count,
+    };
+    vga::init_gui(&sidebar);
+
+    // Welcome message in the chat area
+    vga::term_puts("Welcome to MatrixOS — Bare-Metal AI\n", vga::C_CYAN);
+    vga::term_puts("Type a question and press ENTER.\n", vga::C_DIM);
+    vga::term_puts("(First response may take 1-2 min)\n\n", vga::C_DIM);
+
+    // ── Stage 8: Interactive REPL ─────────────────────────────────────────
     let mut kb  = keyboard::Keyboard::new();
     let mut buf = [0u8; 256];
+    let mut total_tokens: u32 = 0;
 
     loop {
-        vga::term_puts("USER> ", 0x00FFFF);
-        let len = read_line(&mut kb, &mut buf);
+        // Echo USER label into chat area, then read from GUI input box
+        vga::term_puts("USER: ", vga::C_USER);
+        let len = read_line_gui(&mut kb, &mut buf);
         if len == 0 { continue; }
+
+        // Echo typed text + newline into chat area
+        for i in 0..len { vga::term_putc(buf[i], vga::C_TEXT); }
+        vga::term_putc(b'\n', 0);
 
         let user_text = core::str::from_utf8(&buf[..len]).unwrap_or("?");
 
-        // Tokenize
-        vga::term_puts("AI>   ", 0x00FF41);
+        // AI response prefix
+        vga::term_puts("AI:   ", vga::C_AI);
 
+        // Tokenize using ChatML format
         let mut prompt_tokens: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
         if let Some(ref tok) = tokenizer {
             tok.build_chat_prompt(user_text, &mut prompt_tokens);
         } else {
-            // Fallback: byte-level tokens
             for &b in user_text.as_bytes() { prompt_tokens.push(b as u32); }
         }
 
@@ -247,28 +269,41 @@ pub extern "C" fn _start() -> ! {
         // Generate response — tokens printed as they arrive
         let tok_ref = &tokenizer;
         let mut tok_buf = [0u8; 32];
+        let mut turn_tokens: u32 = 0;
+
         model::generate(
             &gguf,
             &cfg,
             &mut kv,
             &mut scratch,
             &prompt_tokens,
-            64, // max new tokens
+            64, // max new tokens per turn
             |token_id| {
+                turn_tokens += 1;
+                total_tokens += 1;
+
+                // Decode and print the token
                 if let Some(ref t) = *tok_ref {
                     if let Some(s) = t.get_token(token_id as usize) {
                         let n = tokenizer::decode_token_to_buf(s, &mut tok_buf);
                         for i in 0..n {
-                            vga::term_putc(tok_buf[i], 0x00FF41);
+                            vga::term_putc(tok_buf[i], vga::C_AI);
                         }
                     }
                 } else {
-                    // Fallback: print token id
-                    vga::term_putu32(token_id, 0x00FF41);
-                    vga::term_putc(b' ', 0x00FF41);
+                    vga::term_putu32(token_id, vga::C_AI);
+                    vga::term_putc(b' ', 0);
+                }
+
+                // Update status bar token counter every 8 tokens to reduce overhead
+                if total_tokens % 8 == 0 {
+                    vga::update_status_tokens(total_tokens);
                 }
             },
         );
+
+        // Final token count update
+        vga::update_status_tokens(total_tokens);
         vga::term_puts("\n\n", 0);
     }
 }
@@ -277,16 +312,18 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    vga::emergency_fill(0xFF0000);
+    vga::emergency_fill(0x3D0000);
     unsafe {
         if !vga::FB_PTR.is_null() {
-            vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP, 20, 20,
-                             "!!! KERNEL PANIC !!!", 0xFFFFFF);
+            vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
+                             20, 20, "!!! KERNEL PANIC !!!", 0xFF4444);
+            vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
+                             20, 44, "MatrixOS halted", 0xC9D1D9);
             if let Some(loc) = info.location() {
-                vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP, 20, 44,
-                                 loc.file(), 0xFFFF00);
-                vga::draw_hex(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP, 20, 68,
-                              loc.line() as u64, 0xFFFFFF);
+                vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
+                                 20, 68, loc.file(), 0xE3B341);
+                vga::draw_hex(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
+                              20, 92, loc.line() as u64, 0xFFFFFF);
             }
         }
     }

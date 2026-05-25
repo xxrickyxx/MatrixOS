@@ -34,30 +34,32 @@ pub fn fast_inv_sqrt(x: f32) -> f32 {
 
 /// Softmax in-place (numerically stable: subtract max first).
 pub fn softmax(x: &mut [f32]) {
-    let n   = x.len();
+    let n = x.len();
     if n == 0 { return; }
     let mut max = x[0];
     for &v in &x[1..] { if v > max { max = v; } }
     let mut sum = 0.0f32;
     for v in x.iter_mut() { *v = fast_exp(*v - max); sum += *v; }
-    if sum > 0.0 {
-        for v in x.iter_mut() { *v /= sum; }
-    }
+    // Guard: if sum is zero or negative (shouldn't happen with clamped fast_exp,
+    // but be safe), fall back to uniform distribution.
+    let inv = if sum > 1e-30 { 1.0 / sum } else { 1.0 / n as f32 };
+    for v in x.iter_mut() { *v *= inv; }
 }
 
 /// Fast approximation of e^x suitable for softmax.
 #[inline(always)]
 pub fn fast_exp(x: f32) -> f32 {
-    // Polynomial approximation accurate to ~0.1% for |x| < 88
-    // Using: e^x ≈ 2^(x * log2(e)) via bit manipulation
+    // CRITICAL: clamp before the integer cast.  For x < -87, the biased exponent
+    // (ti + 127) goes negative; casting to u32 wraps around producing a huge
+    // negative float (e.g. -5e33) instead of ≈0.  That poisons the softmax sum
+    // (makes it negative → normalization skipped → -inf attention weights → NaN).
+    if x < -87.0 { return 0.0; }
+    if x >  87.0 { return 3.402_823_5e38_f32; }   // near f32::MAX, won't overflow
     const LN2_INV: f32 = 1.442695_f32;
     let t = x * LN2_INV;
-    // Split into integer and fractional parts
     let ti = t as i32;
     let tf = t - ti as f32;
-    // Polynomial for 2^tf (Horner form, [0,1])
     let p = 1.0 + tf * (0.6931472 + tf * (0.2402265 + tf * (0.0555041 + tf * 0.0096181)));
-    // Assemble IEEE 754 exponent
     let exp_bits = ((ti + 127) as u32) << 23;
     let base = f32::from_bits(exp_bits);
     base * p

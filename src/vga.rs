@@ -1,20 +1,51 @@
+// ── Framebuffer globals ───────────────────────────────────────────────────────
 pub static mut FB_PTR:    *mut u8 = core::ptr::null_mut();
 pub static mut FB_PITCH:  usize   = 0;
 pub static mut FB_BPP:    usize   = 0;
 pub static mut FB_WIDTH:  usize   = 0;
 pub static mut FB_HEIGHT: usize   = 0;
 
-// Terminal cursor (in pixels)
+// ── Terminal cursor (char units) ──────────────────────────────────────────────
 pub static mut CUR_X: usize = 0;
 pub static mut CUR_Y: usize = 0;
 
-pub const CHAR_W: usize = 9;  // pixel width per glyph (8 + 1 spacing)
-pub const CHAR_H: usize = 16; // pixel height per line  (8 + 8 spacing)
+// ── Terminal bounds (pixel units) — set by init_gui() ────────────────────────
+pub static mut TERM_LEFT:   usize = 0;
+pub static mut TERM_TOP:    usize = 0;
+pub static mut TERM_RIGHT:  usize = 1024;
+pub static mut TERM_BOTTOM: usize = 768;
 
-// ─── 8×8 bitmap font: all printable ASCII ────────────────────────────────────
+// ── Token counter for status bar ─────────────────────────────────────────────
+pub static mut TOK_COUNT: u32 = 0;
+
+pub const CHAR_W: usize = 9;
+pub const CHAR_H: usize = 16;
+
+// ── GUI layout constants ──────────────────────────────────────────────────────
+pub const HDR_H:    usize = 36;
+pub const SIDE_W:   usize = 200;
+pub const STATUS_H: usize = 18;
+pub const INPUT_H:  usize = 46;
+
+// ── Palette ───────────────────────────────────────────────────────────────────
+pub const C_BG:      u32 = 0x0D1117;
+pub const C_SIDE:    u32 = 0x0F131A;
+pub const C_HDR:     u32 = 0x161B22;
+pub const C_BORDER:  u32 = 0x30363D;
+pub const C_BORDER2: u32 = 0x21262D;
+pub const C_GREEN:   u32 = 0x3FB950;
+pub const C_CYAN:    u32 = 0x58A6FF;
+pub const C_ORANGE:  u32 = 0xE3B341;
+pub const C_RED:     u32 = 0xF85149;
+pub const C_TEXT:    u32 = 0xC9D1D9;
+pub const C_DIM:     u32 = 0x6E7681;
+pub const C_USER:    u32 = 0x79C0FF;
+pub const C_AI:      u32 = 0x56D364;
+pub const C_BOOT:    u32 = 0xC9D1D9;
+
+// ── 8×8 bitmap font ───────────────────────────────────────────────────────────
 pub const FONT: [[u8; 8]; 128] = {
     let mut f = [[0u8; 8]; 128];
-    // Uppercase
     f[b'A' as usize] = [0x18,0x24,0x42,0x42,0x7E,0x42,0x42,0x42];
     f[b'B' as usize] = [0x7C,0x42,0x42,0x7C,0x42,0x42,0x7C,0x00];
     f[b'C' as usize] = [0x3C,0x42,0x40,0x40,0x40,0x42,0x3C,0x00];
@@ -41,7 +72,6 @@ pub const FONT: [[u8; 8]; 128] = {
     f[b'X' as usize] = [0x42,0x42,0x24,0x18,0x24,0x42,0x42,0x00];
     f[b'Y' as usize] = [0x42,0x42,0x24,0x18,0x18,0x18,0x18,0x00];
     f[b'Z' as usize] = [0x7E,0x02,0x04,0x08,0x10,0x20,0x7E,0x00];
-    // Lowercase
     f[b'a' as usize] = [0x00,0x00,0x3C,0x02,0x3E,0x42,0x3F,0x00];
     f[b'b' as usize] = [0x40,0x40,0x5C,0x62,0x42,0x62,0x5C,0x00];
     f[b'c' as usize] = [0x00,0x00,0x3C,0x42,0x40,0x42,0x3C,0x00];
@@ -68,7 +98,6 @@ pub const FONT: [[u8; 8]; 128] = {
     f[b'x' as usize] = [0x00,0x00,0x42,0x24,0x18,0x24,0x42,0x00];
     f[b'y' as usize] = [0x00,0x00,0x42,0x42,0x3E,0x02,0x3C,0x00];
     f[b'z' as usize] = [0x00,0x00,0x7E,0x04,0x18,0x20,0x7E,0x00];
-    // Digits
     f[b'0' as usize] = [0x3C,0x42,0x46,0x4A,0x52,0x62,0x3C,0x00];
     f[b'1' as usize] = [0x18,0x38,0x18,0x18,0x18,0x18,0x3C,0x00];
     f[b'2' as usize] = [0x3C,0x42,0x02,0x0C,0x30,0x40,0x7E,0x00];
@@ -79,7 +108,6 @@ pub const FONT: [[u8; 8]; 128] = {
     f[b'7' as usize] = [0x7E,0x02,0x04,0x08,0x10,0x10,0x10,0x00];
     f[b'8' as usize] = [0x3C,0x42,0x42,0x3C,0x42,0x42,0x3C,0x00];
     f[b'9' as usize] = [0x3C,0x42,0x42,0x3E,0x02,0x42,0x3C,0x00];
-    // Punctuation / symbols
     f[b' '  as usize] = [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00];
     f[b'.'  as usize] = [0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00];
     f[b','  as usize] = [0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x08];
@@ -113,8 +141,56 @@ pub const FONT: [[u8; 8]; 128] = {
     f
 };
 
-// ─── Low-level pixel drawing ──────────────────────────────────────────────────
+// ── Low-level pixel primitives ────────────────────────────────────────────────
 
+#[inline(always)]
+fn put_pixel(x: usize, y: usize, r: u8, g: u8, b: u8) {
+    unsafe {
+        if FB_PTR.is_null() || x >= FB_WIDTH || y >= FB_HEIGHT { return; }
+        let off = y * FB_PITCH + x * FB_BPP;
+        *FB_PTR.add(off)     = b;
+        *FB_PTR.add(off + 1) = g;
+        *FB_PTR.add(off + 2) = r;
+    }
+}
+
+pub fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    let r = ((color >> 16) & 0xFF) as u8;
+    let g = ((color >>  8) & 0xFF) as u8;
+    let b = (color & 0xFF) as u8;
+    unsafe {
+        if FB_PTR.is_null() { return; }
+        let x1 = (x + w).min(FB_WIDTH);
+        let y1 = (y + h).min(FB_HEIGHT);
+        for py in y..y1 {
+            let row_off = py * FB_PITCH;
+            for px in x..x1 {
+                let off = row_off + px * FB_BPP;
+                *FB_PTR.add(off)     = b;
+                *FB_PTR.add(off + 1) = g;
+                *FB_PTR.add(off + 2) = r;
+            }
+        }
+    }
+}
+
+pub fn draw_hline(x: usize, y: usize, w: usize, color: u32) {
+    fill_rect(x, y, w, 1, color);
+}
+
+pub fn draw_vline(x: usize, y: usize, h: usize, color: u32) {
+    fill_rect(x, y, 1, h, color);
+}
+
+/// Draw a rectangle border (1px thick).
+pub fn draw_rect_border(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    draw_hline(x,         y,         w, color);
+    draw_hline(x,         y + h - 1, w, color);
+    draw_vline(x,         y,         h, color);
+    draw_vline(x + w - 1, y,         h, color);
+}
+
+/// Draw a character on the raw framebuffer.
 pub fn draw_char(fb: *mut u8, pitch: usize, bpp: usize, x: usize, y: usize, c: u8, color: u32) {
     if c >= 128 { return; }
     let glyph = FONT[c as usize];
@@ -135,10 +211,13 @@ pub fn draw_char(fb: *mut u8, pitch: usize, bpp: usize, x: usize, y: usize, c: u
     }
 }
 
+/// Draw a string to an arbitrary framebuffer position.
 pub fn draw_string(fb: *mut u8, pitch: usize, bpp: usize, x: usize, y: usize, s: &str, color: u32) {
     let mut cx = x;
     for &byte in s.as_bytes() {
-        draw_char(fb, pitch, bpp, cx, y, byte, color);
+        if byte < 128 {
+            draw_char(fb, pitch, bpp, cx, y, byte, color);
+        }
         cx += CHAR_W;
     }
 }
@@ -157,7 +236,21 @@ pub fn draw_hex(fb: *mut u8, pitch: usize, bpp: usize, x: usize, y: usize, val: 
     }
 }
 
-// ─── Terminal functions ───────────────────────────────────────────────────────
+/// Draw a string to the screen using the global FB.
+fn draw_str_at(x: usize, y: usize, s: &str, color: u32) {
+    unsafe { draw_string(FB_PTR, FB_PITCH, FB_BPP, x, y, s, color); }
+}
+
+// ── GUI initialisation ────────────────────────────────────────────────────────
+
+pub struct SidebarInfo<'a> {
+    pub model_name:    &'a str,
+    pub quant:         &'a str,
+    pub n_tensors:     u32,
+    pub d_model:       u32,
+    pub n_layers:      u32,
+    pub vocab:         u32,
+}
 
 pub fn init_terminal(fb: *mut u8, pitch: usize, bpp: usize, width: usize, height: usize) {
     unsafe {
@@ -166,99 +259,257 @@ pub fn init_terminal(fb: *mut u8, pitch: usize, bpp: usize, width: usize, height
         FB_BPP    = bpp;
         FB_WIDTH  = width;
         FB_HEIGHT = height;
-        CUR_X     = 0;
-        CUR_Y     = 0;
+        // Default: full screen terminal (pre-GUI boot)
+        TERM_LEFT   = 4;
+        TERM_TOP    = 4;
+        TERM_RIGHT  = width;
+        TERM_BOTTOM = height;
+        CUR_X = 0;
+        CUR_Y = 0;
     }
 }
 
-fn clear_row(y: usize) {
+/// Draw the full GUI chrome and set terminal bounds to the chat area.
+pub fn init_gui(info: &SidebarInfo) {
     unsafe {
         if FB_PTR.is_null() { return; }
-        let row_bytes = CHAR_H * FB_PITCH;
-        let start     = y * FB_PITCH;
-        let end       = start + row_bytes;
-        let end       = end.min(FB_HEIGHT * FB_PITCH);
-        for i in start..end {
-            *FB_PTR.add(i) = 0;
-        }
+        let w = FB_WIDTH;
+        let h = FB_HEIGHT;
+
+        // ── Background ──────────────────────────────────────────────────────
+        fill_rect(0, 0, w, h, C_BG);
+
+        // ── Header bar ──────────────────────────────────────────────────────
+        fill_rect(0, 0, w, HDR_H, C_HDR);
+        draw_hline(0, HDR_H - 1, w, C_BORDER);
+        // Logo left
+        draw_str_at(12, 10, "MATRIX", C_GREEN);
+        draw_str_at(12 + 6*CHAR_W, 10, "OS", C_CYAN);
+        draw_str_at(12 + 8*CHAR_W + 6, 10, "v3.0", C_DIM);
+        // Title centre
+        let title = "BARE-METAL LLM OPERATING SYSTEM";
+        let tx = w / 2 - title.len() * CHAR_W / 2;
+        draw_str_at(tx, 10, title, C_DIM);
+        // Live indicator right
+        let live_x = w.saturating_sub(80);
+        fill_rect(live_x, 12, 8, 8, C_GREEN);
+        draw_str_at(live_x + 12, 10, "LIVE", C_GREEN);
+
+        // ── Sidebar ─────────────────────────────────────────────────────────
+        let sidebar_h = h.saturating_sub(HDR_H + STATUS_H);
+        fill_rect(0, HDR_H, SIDE_W, sidebar_h, C_SIDE);
+        draw_vline(SIDE_W, HDR_H, sidebar_h, C_BORDER);
+
+        // Sidebar sections
+        let sx = 10usize;
+        let mut sy = HDR_H + 12;
+
+        // ─ MODEL ─
+        draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
+        draw_str_at(sx, sy, "MODEL", C_CYAN);
+        sy += 20;
+        draw_str_at(sx, sy, info.model_name, C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, info.quant,      C_ORANGE); sy += CHAR_H + 2;
+
+        // tensors label
+        let mut nbuf = [0u8; 6];
+        let ns = u32_to_str(info.n_tensors, &mut nbuf);
+        draw_str_at(sx, sy, "Tensors: ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, ns, C_TEXT); sy += CHAR_H + 2;
+
+        // d_model
+        let mut db = [0u8; 6];
+        let ds = u32_to_str(info.d_model, &mut db);
+        draw_str_at(sx, sy, "d_model: ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, ds, C_TEXT); sy += CHAR_H + 2;
+
+        // layers
+        let mut lb = [0u8; 4];
+        let ls = u32_to_str(info.n_layers, &mut lb);
+        draw_str_at(sx, sy, "Layers:  ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, ls, C_TEXT); sy += CHAR_H + 2;
+
+        // vocab
+        let mut vb = [0u8; 8];
+        let vs = u32_to_str(info.vocab, &mut vb);
+        draw_str_at(sx, sy, "Vocab:   ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, vs, C_TEXT); sy += CHAR_H + 8;
+
+        // ─ SYSTEM ─
+        draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
+        draw_str_at(sx, sy, "SYSTEM", C_CYAN); sy += 20;
+        draw_str_at(sx, sy, "Heap:  20 MB",  C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "KV:   ~14 MB",  C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "ISA:  SSE4.2",  C_TEXT); sy += CHAR_H + 8;
+
+        // ─ CONTROLS ─
+        draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
+        draw_str_at(sx, sy, "CONTROLS", C_CYAN); sy += 20;
+        draw_str_at(sx, sy, "ENTER  send",   C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "BKSP   delete", C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "Slow on bare",  C_DIM); sy += CHAR_H;
+        draw_str_at(sx, sy, "metal — wait!", C_ORANGE);
+
+        // ── Status bar ───────────────────────────────────────────────────────
+        let sbar_y = h.saturating_sub(STATUS_H);
+        fill_rect(0, sbar_y, w, STATUS_H, C_HDR);
+        draw_hline(0, sbar_y, w, C_BORDER);
+        draw_str_at(8, sbar_y + 4, "MatrixOS v3.0", C_DIM);
+        draw_vline(SIDE_W, sbar_y, STATUS_H, C_BORDER);
+        draw_str_at(SIDE_W + 8, sbar_y + 4, "Qwen2.5-7B  Q4_K_M", C_DIM);
+
+        // ── Input area ───────────────────────────────────────────────────────
+        let input_y = h.saturating_sub(STATUS_H + INPUT_H);
+        fill_rect(SIDE_W + 1, input_y, w - SIDE_W - 1, INPUT_H, C_SIDE);
+        draw_hline(SIDE_W + 1, input_y, w - SIDE_W - 1, C_BORDER);
+        // Prompt prefix
+        draw_str_at(SIDE_W + 10, input_y + 14, "USER", C_USER);
+        draw_str_at(SIDE_W + 10 + 4*CHAR_W, input_y + 14, ">", C_BORDER);
+
+        // ── Set terminal bounds to chat area ─────────────────────────────────
+        let chat_top    = HDR_H + 4;
+        let chat_bottom = input_y.saturating_sub(2);
+        let chat_left   = SIDE_W + 6;
+        let chat_right  = w.saturating_sub(4);
+        TERM_LEFT   = chat_left;
+        TERM_TOP    = chat_top;
+        TERM_RIGHT  = chat_right;
+        TERM_BOTTOM = chat_bottom;
+        CUR_X = 0;
+        CUR_Y = 0;
     }
 }
+
+/// Update the status bar token count.
+pub fn update_status_tokens(n: u32) {
+    unsafe {
+        TOK_COUNT = n;
+        if FB_PTR.is_null() { return; }
+        let h      = FB_HEIGHT;
+        let w      = FB_WIDTH;
+        let sbar_y = h.saturating_sub(STATUS_H);
+        // Clear the token area
+        let tok_x = w.saturating_sub(120);
+        fill_rect(tok_x, sbar_y + 1, 118, STATUS_H - 2, C_HDR);
+        // Draw "Tok: NNNN"
+        draw_str_at(tok_x, sbar_y + 4, "Tok:", C_DIM);
+        let mut b = [0u8; 8];
+        let s = u32_to_str(n, &mut b);
+        draw_str_at(tok_x + 5*CHAR_W, sbar_y + 4, s, C_GREEN);
+    }
+}
+
+/// Draw (or refresh) the input line. `buf` is the current text, `len` the length.
+pub fn draw_input_line(buf: &[u8], len: usize) {
+    unsafe {
+        if FB_PTR.is_null() { return; }
+        let h       = FB_HEIGHT;
+        let w       = FB_WIDTH;
+        let input_y = h.saturating_sub(STATUS_H + INPUT_H);
+        let text_x  = SIDE_W + 10 + 6 * CHAR_W; // after "USER> "
+        let text_w  = w.saturating_sub(text_x + 20);
+
+        // Clear text area
+        fill_rect(text_x, input_y + 6, text_w, CHAR_H + 4, C_SIDE);
+
+        // Draw typed text
+        for i in 0..len.min(text_w / CHAR_W) {
+            let c = if buf[i] >= 32 && buf[i] < 128 { buf[i] } else { b'?' };
+            let cx = text_x + i * CHAR_W;
+            draw_char(FB_PTR, FB_PITCH, FB_BPP, cx, input_y + 8, c, C_TEXT);
+        }
+        // Cursor
+        let cur_x = text_x + len.min(text_w / CHAR_W) * CHAR_W;
+        fill_rect(cur_x, input_y + 8, 6, CHAR_H - 2, C_GREEN);
+    }
+}
+
+// ── Terminal functions ────────────────────────────────────────────────────────
 
 pub fn scroll_up() {
     unsafe {
-        if FB_PTR.is_null() || FB_HEIGHT == 0 { return; }
-        let total    = FB_HEIGHT * FB_PITCH;
-        let one_line = CHAR_H   * FB_PITCH;
-        // Shift pixels up by one line
-        for i in 0..total.saturating_sub(one_line) {
-            *FB_PTR.add(i) = *FB_PTR.add(i + one_line);
+        if FB_PTR.is_null() { return; }
+        let left   = TERM_LEFT;
+        let top    = TERM_TOP;
+        let bottom = TERM_BOTTOM;
+        let right  = TERM_RIGHT.min(FB_WIDTH);
+        if bottom <= top + CHAR_H { return; }
+
+        // Scroll rows up, only within the chat column range.
+        let h = bottom.saturating_sub(top);
+        for row_off in 0..h.saturating_sub(CHAR_H) {
+            let sy = top + row_off + CHAR_H;
+            let dy = top + row_off;
+            if sy >= FB_HEIGHT { break; }
+            for px in left..right {
+                let src = sy * FB_PITCH + px * FB_BPP;
+                let dst = dy * FB_PITCH + px * FB_BPP;
+                for b in 0..FB_BPP {
+                    *FB_PTR.add(dst + b) = *FB_PTR.add(src + b);
+                }
+            }
         }
-        // Clear last line
-        let last = total.saturating_sub(one_line);
-        for i in last..total {
-            *FB_PTR.add(i) = 0;
-        }
+        // Clear the last row in the chat column range
+        let clear_y = bottom.saturating_sub(CHAR_H);
+        fill_rect(left, clear_y, right.saturating_sub(left), CHAR_H, C_BG);
     }
 }
 
-/// Print a single char to the terminal, handling '\n', wrapping, and scrolling.
+/// Print a single char to the terminal (bounded by TERM_LEFT/RIGHT/TOP/BOTTOM).
 pub fn term_putc(c: u8, color: u32) {
     unsafe {
         if FB_PTR.is_null() { return; }
-        let max_cols = if FB_WIDTH  > 0 { FB_WIDTH  / CHAR_W } else { 80 };
-        let max_rows = if FB_HEIGHT > 0 { FB_HEIGHT / CHAR_H } else { 50 };
+        let max_cols = (TERM_RIGHT.saturating_sub(TERM_LEFT)) / CHAR_W;
+        let max_rows = (TERM_BOTTOM.saturating_sub(TERM_TOP))  / CHAR_H;
+        if max_cols == 0 || max_rows == 0 { return; }
 
-        if c == b'\n' || c == b'\r' {
-            CUR_X = 0;
-            CUR_Y += 1;
-        } else if c == 0x08 /* backspace */ {
-            if CUR_X > 0 {
-                CUR_X -= 1;
-                // Erase char pixel
-                draw_char(FB_PTR, FB_PITCH, FB_BPP, CUR_X * CHAR_W, CUR_Y * CHAR_H, b' ', 0);
-            }
-        } else {
-            draw_char(FB_PTR, FB_PITCH, FB_BPP, CUR_X * CHAR_W, CUR_Y * CHAR_H, c, color);
-            CUR_X += 1;
-            if CUR_X >= max_cols {
+        match c {
+            b'\n' | b'\r' => {
                 CUR_X = 0;
                 CUR_Y += 1;
             }
+            0x08 => {
+                // backspace
+                if CUR_X > 0 {
+                    CUR_X -= 1;
+                    let px = TERM_LEFT + CUR_X * CHAR_W;
+                    let py = TERM_TOP  + CUR_Y * CHAR_H;
+                    fill_rect(px, py, CHAR_W, CHAR_H, C_BG);
+                }
+            }
+            _ if c >= 32 => {
+                let px = TERM_LEFT + CUR_X * CHAR_W;
+                let py = TERM_TOP  + CUR_Y * CHAR_H;
+                draw_char(FB_PTR, FB_PITCH, FB_BPP, px, py, c, color);
+                CUR_X += 1;
+                if CUR_X >= max_cols {
+                    CUR_X = 0;
+                    CUR_Y += 1;
+                }
+            }
+            _ => {}
         }
 
-        // Scroll when we reach the bottom
         if CUR_Y >= max_rows {
             scroll_up();
             CUR_Y = max_rows - 1;
-            clear_row(CUR_Y * CHAR_H); // clear new blank bottom row
         }
     }
 }
 
 pub fn term_puts(s: &str, color: u32) {
-    for &b in s.as_bytes() {
-        term_putc(b, color);
-    }
+    for &b in s.as_bytes() { term_putc(b, color); }
 }
 
 pub fn term_putu32(n: u32, color: u32) {
-    if n == 0 { term_putc(b'0', color); return; }
     let mut buf = [0u8; 10];
-    let mut i   = 10usize;
-    let mut v   = n;
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    for &b in &buf[i..] { term_putc(b, color); }
+    let s = u32_to_str(n, &mut buf);
+    term_puts(s, color);
 }
 
-pub fn term_newline() {
-    term_putc(b'\n', 0);
-}
+pub fn term_newline() { term_putc(b'\n', 0); }
 
-// ─── Panic helper ─────────────────────────────────────────────────────────────
+// ── Panic helper ─────────────────────────────────────────────────────────────
 
 pub fn emergency_fill(color: u32) {
     unsafe {
@@ -266,7 +517,7 @@ pub fn emergency_fill(color: u32) {
         let r = ((color >> 16) & 0xFF) as u8;
         let g = ((color >>  8) & 0xFF) as u8;
         let b = (color & 0xFF) as u8;
-        let total = if FB_HEIGHT > 0 { FB_HEIGHT * FB_PITCH } else { 500_000 };
+        let total = FB_HEIGHT * FB_PITCH;
         let mut i = 0usize;
         while i + 2 < total {
             *FB_PTR.add(i)     = b;
@@ -275,4 +526,22 @@ pub fn emergency_fill(color: u32) {
             i += FB_BPP.max(3);
         }
     }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+/// Write decimal representation of n into buf; returns the slice of digits.
+pub fn u32_to_str<'a>(mut n: u32, buf: &'a mut [u8]) -> &'a str {
+    if n == 0 {
+        if !buf.is_empty() { buf[0] = b'0'; }
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let len = buf.len();
+    let mut i = len;
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    core::str::from_utf8(&buf[i..len]).unwrap_or("?")
 }
