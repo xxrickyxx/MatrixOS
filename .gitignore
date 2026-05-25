@@ -1,0 +1,20 @@
+﻿# QEMU installation - large binaries, never commit
+qemu/
+
+# Build artifacts
+target/
+*.iso
+*.img
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model files - too large for git
+*.gguf
+*.bin
+*.safetensors
+
+# OS files
+Thumbs.db
+.DS_Store
