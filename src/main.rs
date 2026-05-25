@@ -195,6 +195,7 @@ fn handle_slash_command(
     auto_pick: &mut bool,
     total_tokens: u32,
     tsc: u64,
+    boot_tsc: u64,
     nic: &str, usb: &str, gpu: &str, storage: &str,
     model_name: &str,
     d_model: u32, n_layers: u32,
@@ -221,6 +222,8 @@ fn handle_slash_command(
             vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
             vga::term_puts("  /save              persist apps + settings to disk\n", vga::C_DIM);
             vga::term_puts("  /load              read saved state from disk\n", vga::C_DIM);
+            vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
+            vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
             vga::term_puts("Hotkeys: F1 chat · F2 code · TAB toggle auto · F5 clear\n", vga::C_DIM);
         }
@@ -398,6 +401,40 @@ fn handle_slash_command(
             } else {
                 vga::term_puts("usage: /set key=value\n", vga::C_RED);
             }
+        }
+        "/meminfo" => {
+            let used = allocator::heap_used();
+            let free = allocator::heap_free();
+            let total = used + free;
+            vga::term_puts("Heap (bytes):\n", vga::C_CYAN);
+            vga::term_puts("  used: ", vga::C_DIM);
+            vga::term_putu32((used / 1024) as u32, vga::C_ORANGE);
+            vga::term_puts(" KB\n", vga::C_DIM);
+            vga::term_puts("  free: ", vga::C_DIM);
+            vga::term_putu32((free / (1024*1024)) as u32, vga::C_ORANGE);
+            vga::term_puts(" MB\n", vga::C_DIM);
+            vga::term_puts("  total:", vga::C_DIM);
+            vga::term_putu32((total / (1024*1024)) as u32, vga::C_ORANGE);
+            vga::term_puts(" MB", vga::C_DIM);
+            vga::term_puts("  (utilisation: ", vga::C_DIM);
+            let pct = if total > 0 { (used * 100 / total) as u32 } else { 0 };
+            vga::term_putu32(pct, vga::C_ORANGE);
+            vga::term_puts("%)\n", vga::C_DIM);
+        }
+        "/uptime" => {
+            let elapsed_ticks = tsc.wrapping_sub(boot_tsc);
+            let hz   = math::tsc_hz();
+            let secs = elapsed_ticks / hz;
+            let ms   = (elapsed_ticks % hz) * 1000 / hz;
+            vga::term_puts("Uptime: ", vga::C_DIM);
+            vga::term_putu32(secs as u32, vga::C_GREEN);
+            vga::term_puts(".", vga::C_DIM);
+            if ms < 100 { vga::term_putc(b'0', vga::C_GREEN); }
+            if ms <  10 { vga::term_putc(b'0', vga::C_GREEN); }
+            vga::term_putu32(ms as u32, vga::C_GREEN);
+            vga::term_puts(" s  TSC=", vga::C_DIM);
+            vga::term_putu32((hz / 1_000_000) as u32, vga::C_ORANGE);
+            vga::term_puts(" MHz\n", vga::C_DIM);
         }
         "/save" => {
             let settings = state::Settings {
@@ -956,6 +993,16 @@ pub extern "C" fn _start() -> ! {
         vga::term_puts("[OK] AVX2 not present — using SSE3 (4-wide)\n", vga::C_DIM);
     }
 
+    // Calibrate TSC via the 8254 PIT so /uptime and tok/s are honest.
+    // Skipping calibration is OK — TSC_HZ defaults to 3 GHz.
+    unsafe { math::calibrate_tsc_via_pit(); }
+    vga::term_puts("[OK] TSC ", vga::C_GREEN);
+    vga::term_putu32((math::tsc_hz() / 1_000_000) as u32, vga::C_ORANGE);
+    vga::term_puts(" MHz\n", vga::C_DIM);
+
+    // Remember TSC at boot for /uptime measurement.
+    let boot_tsc: u64 = math::rdtsc();
+
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 3, 0xFF, 0x80, 0x00); }
 
     unsafe { idt::init(); }
@@ -1330,6 +1377,7 @@ pub extern "C" fn _start() -> ! {
                 &mut auto_pick,
                 total_tokens,
                 math::rdtsc(),
+                boot_tsc,
                 nic_label, usb_label, gpu_label, storage_label,
                 active_name,
                 active_cfg.d_model as u32,
@@ -1439,14 +1487,11 @@ pub extern "C" fn _start() -> ! {
             vga::term_puts(" tool call(s) executed]", vga::C_DIM);
         }
 
-        // Compute approximate tok/s: Δtsc / 3_000_000_000 ≈ seconds elapsed
+        // Compute tok/s using the calibrated TSC frequency (math::tsc_hz()).
         let tsc_end  = math::rdtsc();
         let delta    = tsc_end.wrapping_sub(tsc_start);
-        // 3 GHz → 3e9 ticks/s; avoid division by zero
         let toks_per_sec: u32 = if delta > 0 && turn_tokens > 0 {
-            // tok/s = turn_tokens / (delta / 3e9) = turn_tokens * 3e9 / delta
-            // Use u64 to avoid overflow
-            let num = (turn_tokens as u64).saturating_mul(3_000_000_000u64);
+            let num = (turn_tokens as u64).saturating_mul(math::tsc_hz());
             (num / delta) as u32
         } else { 0 };
 

@@ -62,6 +62,15 @@ pub fn init_with_memmap(hhdm: u64) {
     }
 }
 
+/// Heap usage snapshot (bytes).
+pub fn heap_used() -> usize {
+    ALLOCATOR.lock().used()
+}
+
+pub fn heap_free() -> usize {
+    ALLOCATOR.lock().free()
+}
+
 /// Old-style entry retained for callers; uses the fallback static heap only.
 pub fn init() {
     unsafe {

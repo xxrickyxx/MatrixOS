@@ -180,6 +180,64 @@ pub fn cpu_logical_count() -> u32 {
     { 1 }
 }
 
+/// Cached TSC frequency in Hz, populated by calibrate_tsc_via_pit().
+/// Default 3 GHz so /uptime is roughly right even without calibration.
+static mut TSC_HZ: u64 = 3_000_000_000;
+
+#[inline(always)]
+pub fn tsc_hz() -> u64 { unsafe { TSC_HZ } }
+
+/// Calibrate the TSC against the 8254 PIT.  The PIT runs at 1.193182 MHz
+/// regardless of CPU speed, so we measure how many TSC ticks elapse during
+/// a fixed PIT countdown and convert to Hz.
+///
+/// Programs PIT channel 2 (the speaker channel, safe to use without
+/// interrupting timers) to count down ~50 ms at 1.193182 MHz.  Reads TSC
+/// before and after; (delta_tsc * 1_193_182) / pit_ticks ≈ TSC_HZ.
+pub unsafe fn calibrate_tsc_via_pit() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::asm;
+        // Enable PIT channel 2 gate via port 0x61, bit 0 = 1, bit 1 = 0 (speaker mute)
+        let prev: u8;
+        asm!("in al, 0x61", out("al") prev, options(nostack, nomem, preserves_flags));
+        let new = (prev & 0xFC) | 0x01;
+        asm!("out 0x61, al", in("al") new, options(nostack, nomem, preserves_flags));
+
+        // Program channel 2, mode 0 (interrupt on terminal count), binary, LSB then MSB
+        asm!("out 0x43, al", in("al") 0xB0u8, options(nostack, nomem, preserves_flags));
+        // Count value: 1193182 Hz * 0.05 s ≈ 59659.  We'll use a lower number to
+        // avoid potential 16-bit overflow on slower machines.  Use 11932 = ~10 ms.
+        let count: u16 = 11932;
+        asm!("out 0x42, al", in("al") (count & 0xFF) as u8, options(nostack, nomem, preserves_flags));
+        asm!("out 0x42, al", in("al") (count >> 8)   as u8, options(nostack, nomem, preserves_flags));
+
+        let tsc_start = rdtsc();
+
+        // Wait for OUT2 (port 0x61 bit 5) to go high — terminal count reached.
+        loop {
+            let s: u8;
+            asm!("in al, 0x61", out("al") s, options(nostack, nomem, preserves_flags));
+            if s & 0x20 != 0 { break; }
+        }
+
+        let tsc_end = rdtsc();
+
+        // Restore previous port 0x61 state.
+        asm!("out 0x61, al", in("al") prev, options(nostack, nomem, preserves_flags));
+
+        let delta_tsc = tsc_end.wrapping_sub(tsc_start);
+        // count PIT ticks elapsed at 1_193_182 Hz
+        // ticks / 1193182 = seconds elapsed
+        // tsc_hz = delta_tsc / seconds = delta_tsc * 1193182 / count
+        let hz = delta_tsc.saturating_mul(1_193_182u64) / (count as u64);
+        // Sanity: clamp to plausible range 500MHz .. 8GHz
+        if (500_000_000..=8_000_000_000).contains(&hz) {
+            TSC_HZ = hz;
+        }
+    }
+}
+
 /// Read the x86_64 Time Stamp Counter (TSC).
 /// Used for rough timing; calibration-free (caller divides by ~CPU_HZ).
 #[inline(always)]
