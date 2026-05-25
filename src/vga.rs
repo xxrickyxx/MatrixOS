@@ -249,6 +249,10 @@ pub struct SidebarInfo<'a> {
     pub n_tensors:     u32,
     pub d_model:       u32,
     pub n_layers:      u32,
+    pub n_heads:       u32,
+    pub n_kv_heads:    u32,
+    pub head_dim:      u32,
+    pub ffn_dim:       u32,
     pub vocab:         u32,
 }
 
@@ -329,6 +333,28 @@ pub fn init_gui(info: &SidebarInfo) {
         draw_str_at(sx, sy, "Layers:  ", C_DIM);
         draw_str_at(sx + 9*CHAR_W, sy, ls, C_TEXT); sy += CHAR_H + 2;
 
+        // heads (Q / KV)
+        let mut hb1 = [0u8; 4]; let mut hb2 = [0u8; 4];
+        let hs1 = u32_to_str(info.n_heads,    &mut hb1);
+        let hs2 = u32_to_str(info.n_kv_heads, &mut hb2);
+        draw_str_at(sx, sy, "Heads:   ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, hs1, C_TEXT);
+        draw_str_at(sx + 9*CHAR_W + (hs1.len() as usize) * CHAR_W, sy, "/", C_DIM);
+        draw_str_at(sx + 9*CHAR_W + ((hs1.len() as usize)+1) * CHAR_W, sy, hs2, C_TEXT);
+        sy += CHAR_H + 2;
+
+        // head_dim
+        let mut hdb = [0u8; 4];
+        let hds = u32_to_str(info.head_dim, &mut hdb);
+        draw_str_at(sx, sy, "HeadDim: ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, hds, C_TEXT); sy += CHAR_H + 2;
+
+        // ffn_dim
+        let mut fb = [0u8; 8];
+        let fs = u32_to_str(info.ffn_dim, &mut fb);
+        draw_str_at(sx, sy, "FFN:     ", C_DIM);
+        draw_str_at(sx + 9*CHAR_W, sy, fs, C_TEXT); sy += CHAR_H + 2;
+
         // vocab
         let mut vb = [0u8; 8];
         let vs = u32_to_str(info.vocab, &mut vb);
@@ -356,7 +382,9 @@ pub fn init_gui(info: &SidebarInfo) {
         draw_hline(0, sbar_y, w, C_BORDER);
         draw_str_at(8, sbar_y + 4, "MatrixOS v3.0", C_DIM);
         draw_vline(SIDE_W, sbar_y, STATUS_H, C_BORDER);
-        draw_str_at(SIDE_W + 8, sbar_y + 4, "Qwen2.5-7B  Q4_K_M", C_DIM);
+        draw_str_at(SIDE_W + 8, sbar_y + 4, info.model_name, C_DIM);
+        let name_w = info.model_name.len() * CHAR_W;
+        draw_str_at(SIDE_W + 8 + name_w + CHAR_W, sbar_y + 4, info.quant, C_DIM);
 
         // ── Input area ───────────────────────────────────────────────────────
         let input_y = h.saturating_sub(STATUS_H + INPUT_H);

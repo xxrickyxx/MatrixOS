@@ -41,9 +41,43 @@ impl Default for ModelConfig {
 pub fn load_config_from_gguf(gguf: &Gguf) -> ModelConfig {
     let mut cfg = ModelConfig::default();
 
-    macro_rules! read_u32 {
-        ($key:expr, $field:expr) => {
-            if let Some(v) = gguf.find_metadata($key) {
+    // ── Detect architecture prefix (qwen2, llama, gemma, …) ───────────────
+    // GGUF metadata keys are namespaced by architecture, e.g. for Qwen2.5
+    // the keys are `qwen2.embedding_length` rather than `llama.embedding_length`.
+    // Without this, every architecture-specific key fails to resolve and the
+    // model silently falls back to the 7B `ModelConfig::default()` values —
+    // which is a disaster for any model whose real shape differs.
+    let arch_name: &str = if let Some(GgufValue::String(s)) = gguf.find_metadata("general.architecture") {
+        s
+    } else {
+        "llama"
+    };
+
+    // small stack buffer to compose "<arch>.<suffix>" strings without alloc
+    let mut keybuf = [0u8; 96];
+    fn make_key<'a>(arch: &str, suffix: &str, buf: &'a mut [u8; 96]) -> &'a str {
+        let mut i = 0usize;
+        for &b in arch.as_bytes()    { if i < 95 { buf[i] = b; i += 1; } }
+        if i < 95 { buf[i] = b'.'; i += 1; }
+        for &b in suffix.as_bytes()  { if i < 95 { buf[i] = b; i += 1; } }
+        core::str::from_utf8(&buf[..i]).unwrap_or("")
+    }
+
+    // Lookup: try "<arch>.<suffix>" first, then fall back to "llama.<suffix>"
+    let lookup = |suffix: &str, buf: &mut [u8; 96]| -> Option<GgufValue> {
+        let k1 = make_key(arch_name, suffix, buf);
+        if let Some(v) = gguf.find_metadata(k1) { return Some(v); }
+        if arch_name != "llama" {
+            let mut buf2 = [0u8; 96];
+            let k2 = make_key("llama", suffix, &mut buf2);
+            return gguf.find_metadata(k2);
+        }
+        None
+    };
+
+    macro_rules! read_u32_x {
+        ($suffix:expr, $field:expr) => {
+            if let Some(v) = lookup($suffix, &mut keybuf) {
                 match v {
                     GgufValue::Uint32(n) => $field = n as usize,
                     GgufValue::Int32(n)  => $field = n as usize,
@@ -53,24 +87,21 @@ pub fn load_config_from_gguf(gguf: &Gguf) -> ModelConfig {
             }
         }
     }
-    macro_rules! read_f32 {
-        ($key:expr, $field:expr) => {
-            if let Some(v) = gguf.find_metadata($key) {
-                match v {
-                    GgufValue::Float32(f) => $field = f,
-                    _ => {}
-                }
+    macro_rules! read_f32_x {
+        ($suffix:expr, $field:expr) => {
+            if let Some(v) = lookup($suffix, &mut keybuf) {
+                if let GgufValue::Float32(f) = v { $field = f; }
             }
         }
     }
 
-    read_u32!("llama.embedding_length",        cfg.d_model);
-    read_u32!("llama.block_count",             cfg.n_layers);
-    read_u32!("llama.attention.head_count",    cfg.n_heads);
-    read_u32!("llama.attention.head_count_kv", cfg.n_kv_heads);
-    read_u32!("llama.feed_forward_length",     cfg.ffn_dim);
-    read_u32!("llama.vocab_size",              cfg.vocab_size);
-    read_f32!("llama.rope.freq_base",          cfg.rope_freq);
+    read_u32_x!("embedding_length",        cfg.d_model);
+    read_u32_x!("block_count",             cfg.n_layers);
+    read_u32_x!("attention.head_count",    cfg.n_heads);
+    read_u32_x!("attention.head_count_kv", cfg.n_kv_heads);
+    read_u32_x!("feed_forward_length",     cfg.ffn_dim);
+    read_u32_x!("vocab_size",              cfg.vocab_size);
+    read_f32_x!("rope.freq_base",          cfg.rope_freq);
 
     if let Some(GgufValue::Uint32(v)) = gguf.find_metadata("tokenizer.ggml.bos_token_id") {
         cfg.bos = v;

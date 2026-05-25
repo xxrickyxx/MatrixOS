@@ -182,10 +182,18 @@ pub extern "C" fn _start() -> ! {
 
     // ── Stage 5: Load config + tokenizer ─────────────────────────────────
     let cfg = model::load_config_from_gguf(&gguf);
-    vga::term_puts("[OK] Config: d_model=", vga::C_GREEN);
+    vga::term_puts("[OK] Config: d=", vga::C_GREEN);
     vga::term_putu32(cfg.d_model as u32, vga::C_ORANGE);
-    vga::term_puts(" layers=", vga::C_GREEN);
+    vga::term_puts(" L=", vga::C_GREEN);
     vga::term_putu32(cfg.n_layers as u32, vga::C_ORANGE);
+    vga::term_puts(" H=", vga::C_GREEN);
+    vga::term_putu32(cfg.n_heads as u32, vga::C_ORANGE);
+    vga::term_puts(" KV=", vga::C_GREEN);
+    vga::term_putu32(cfg.n_kv_heads as u32, vga::C_ORANGE);
+    vga::term_puts(" hd=", vga::C_GREEN);
+    vga::term_putu32(cfg.head_dim as u32, vga::C_ORANGE);
+    vga::term_puts(" ff=", vga::C_GREEN);
+    vga::term_putu32(cfg.ffn_dim as u32, vga::C_ORANGE);
     vga::term_puts("\n", 0);
 
     let tokenizer = match tokenizer::Tokenizer::from_gguf(&gguf) {
@@ -221,11 +229,15 @@ pub extern "C" fn _start() -> ! {
 
     let sidebar = vga::SidebarInfo {
         model_name,
-        quant:     "Q4_K_M",
-        n_tensors: gguf.header.tensor_count as u32,
-        d_model:   cfg.d_model as u32,
-        n_layers:  cfg.n_layers as u32,
-        vocab:     vocab_count,
+        quant:      "Q4_K_M",
+        n_tensors:  gguf.header.tensor_count as u32,
+        d_model:    cfg.d_model as u32,
+        n_layers:   cfg.n_layers as u32,
+        n_heads:    cfg.n_heads as u32,
+        n_kv_heads: cfg.n_kv_heads as u32,
+        head_dim:   cfg.head_dim as u32,
+        ffn_dim:    cfg.ffn_dim as u32,
+        vocab:      vocab_count,
     };
     vga::init_gui(&sidebar);
 

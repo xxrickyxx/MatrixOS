@@ -108,18 +108,56 @@ pub fn dequant_q8_0(data: &[u8], out: &mut [f32], n: usize) {
 //   [208..210] d (f16)
 
 pub fn dequant_q6k_block(block: &[u8], out: &mut [f32]) {
+    // Canonical ggml Q6_K layout (block of 256 weights, 210 bytes):
+    //   [0..128]   ql[128]  : 256 low 4-bit nibbles, packed two-per-byte
+    //   [128..192] qh[64]   : 256 high 2-bit values, packed four-per-byte
+    //   [192..208] scales[16] (i8)
+    //   [208..210] d (f16) super-block scale
+    //
+    // The 256 weights are NOT laid out as `out[i] = decode(i)` linearly —
+    // ggml reorders them: each pass of 128 outputs uses 32 ql bytes (split
+    // into low4 of ql[l] and ql[l+32], and high4 of the same), 32 qh bytes,
+    // and 8 of the 16 scales.  Two passes cover the 256 weights.
     debug_assert!(block.len() >= 210);
-    let ql     = &block[0..128];
-    let qh     = &block[128..192];
-    let scales = &block[192..208];
-    let d      = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    let ql_all     = &block[0..128];
+    let qh_all     = &block[128..192];
+    let scales_all = &block[192..208];
+    let d          = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
-    for i in 0..256usize {
-        let lo4  = if i % 2 == 0 { (ql[i / 2]      ) & 0xF } else { (ql[i / 2] >> 4) & 0xF };
-        let hi2  = (qh[i / 4] >> ((i % 4) * 2)) & 0x3;
-        let q6   = (lo4 | (hi2 << 4)) as i8 as i32 - 32;
-        let sc   = scales[i / 16] as i8 as f32;
-        out[i]   = d * sc * q6 as f32;
+    let mut out_off = 0usize;     // running offset into `out`
+    let mut ql_off  = 0usize;     // running offset into ql_all
+    let mut qh_off  = 0usize;     // running offset into qh_all
+    let mut sc_off  = 0usize;     // running offset into scales_all
+
+    // Two passes of 128 weights each (256 total)
+    for _pass in 0..2 {
+        for l in 0..32 {
+            let is = l / 16;                           // 0 or 1
+            let qh_byte = qh_all[qh_off + l] as i32;
+
+            let q1 = ((ql_all[ql_off + l       ] & 0x0F) as i32
+                     | (((qh_byte >> 0) & 0x3) << 4)) - 32;
+            let q2 = ((ql_all[ql_off + l + 32  ] & 0x0F) as i32
+                     | (((qh_byte >> 2) & 0x3) << 4)) - 32;
+            let q3 = ((ql_all[ql_off + l       ] >> 4) as i32
+                     | (((qh_byte >> 4) & 0x3) << 4)) - 32;
+            let q4 = ((ql_all[ql_off + l + 32  ] >> 4) as i32
+                     | (((qh_byte >> 6) & 0x3) << 4)) - 32;
+
+            let sc1 = scales_all[sc_off + is + 0] as i8 as f32;
+            let sc2 = scales_all[sc_off + is + 2] as i8 as f32;
+            let sc3 = scales_all[sc_off + is + 4] as i8 as f32;
+            let sc4 = scales_all[sc_off + is + 6] as i8 as f32;
+
+            out[out_off + l       ] = d * sc1 * q1 as f32;
+            out[out_off + l + 32  ] = d * sc2 * q2 as f32;
+            out[out_off + l + 64  ] = d * sc3 * q3 as f32;
+            out[out_off + l + 96  ] = d * sc4 * q4 as f32;
+        }
+        ql_off  += 64;
+        qh_off  += 32;
+        sc_off  += 8;
+        out_off += 128;
     }
 }
 
