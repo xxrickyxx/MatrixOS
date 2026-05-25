@@ -311,6 +311,42 @@ pub fn read_sectors(addr: DriveAddr, lba: u32, count: u8, buf: &mut [u8]) -> Res
 
 // ── Sector write (28-bit LBA) — DANGEROUS, only called from /install ────────
 
+// ── Bulk install: write a whole byte slice to disk starting at `lba_start` ──
+//
+// Chunked into 64-sector PIO writes so 3 GB fits in ~12 000 commands instead
+// of 6 M.  Calls `progress(bytes_written, total_bytes)` periodically so the
+// caller can paint a progress bar.
+
+pub fn install_image<F: FnMut(usize, usize)>(
+    addr:      DriveAddr,
+    lba_start: u32,
+    data:      &[u8],
+    mut progress: F,
+) -> Result<u32, &'static str> {
+    const CHUNK_SECTORS: u8 = 64;
+    const CHUNK_BYTES:   usize = (CHUNK_SECTORS as usize) * 512;
+    let total = data.len();
+    let mut written = 0usize;
+    let mut lba = lba_start;
+
+    let mut tmp = [0u8; CHUNK_BYTES];
+
+    while written < total {
+        let n = (total - written).min(CHUNK_BYTES);
+        tmp[..n].copy_from_slice(&data[written..written + n]);
+        // Zero-pad the trailing partial sector so we don't write stale data.
+        if n < CHUNK_BYTES {
+            for b in &mut tmp[n..] { *b = 0; }
+        }
+        let sectors = (n + 511) / 512;
+        write_sectors(addr, lba, sectors as u8, &tmp[..sectors * 512])?;
+        lba     += sectors as u32;
+        written += n;
+        progress(written, total);
+    }
+    Ok(lba - lba_start)
+}
+
 pub fn write_sectors(addr: DriveAddr, lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
     if buf.len() < count as usize * 512 {
         return Err("buffer too small");

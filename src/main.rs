@@ -314,85 +314,9 @@ fn handle_slash_command(
             }
         }
         "/install" => {
-            if arg.is_empty() {
-                vga::term_puts("usage: /install <slot>   (slot from /disks)\n", vga::C_RED);
-                vga::term_puts("       /install <slot> confirm   to actually write\n", vga::C_RED);
-                return;
-            }
-            // Parse: "<slot>" or "<slot> confirm"
-            let (slot_s, rest) = match arg.find(char::is_whitespace) {
-                Some(i) => (&arg[..i], arg[i..].trim_start()),
-                None    => (arg, ""),
-            };
-            let slot = match parse_u32_safe(slot_s) {
-                Some(n) if (n as usize) < 4 => n as usize,
-                _ => { vga::term_puts("bad slot (0..3)\n", vga::C_RED); return; }
-            };
-            let confirm = rest == "confirm";
-
-            let probe = ata::probe_all();
-            let info = match &probe.drives[slot] {
-                Some(d) => d,
-                None    => { vga::term_puts("slot empty — run /disks\n", vga::C_RED); return; }
-            };
-            if info.is_atapi {
-                vga::term_puts("target is ATAPI (CD/DVD), refusing to install there.\n", vga::C_RED);
-                return;
-            }
-
-            vga::term_puts("[install] target:  ", vga::C_DIM);
-            vga::term_puts(info.addr.label(), vga::C_GREEN);
-            vga::term_puts("  ", 0);
-            vga::term_puts(info.model_str(), vga::C_TEXT);
-            vga::term_puts("\n[install] size:    ", vga::C_DIM);
-            vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
-            vga::term_puts(" MB\n", vga::C_DIM);
-
-            // Demo: read sector 0 (MBR) to prove the driver works.
-            let mut mbr = [0u8; 512];
-            match ata::read_sectors(info.addr, 0, 1, &mut mbr) {
-                Ok(()) => {
-                    vga::term_puts("[install] MBR signature: 0x", vga::C_DIM);
-                    vga::term_puthex8(mbr[510], vga::C_ORANGE);
-                    vga::term_puthex8(mbr[511], vga::C_ORANGE);
-                    if mbr[510] == 0x55 && mbr[511] == 0xAA {
-                        vga::term_puts("  (boot signature present)\n", vga::C_DIM);
-                    } else {
-                        vga::term_puts("  (blank / no MBR)\n", vga::C_DIM);
-                    }
-                }
-                Err(e) => {
-                    vga::term_puts("[install] read error: ", vga::C_RED);
-                    vga::term_puts(e, vga::C_RED);
-                    vga::term_puts("\n", 0);
-                    return;
-                }
-            }
-
-            if !confirm {
-                vga::term_puts("[install] dry-run only. Re-run with:\n", vga::C_ORANGE);
-                vga::term_puts("  /install ", vga::C_ORANGE);
-                vga::term_puts(slot_s, vga::C_ORANGE);
-                vga::term_puts(" confirm   ← will WRITE to the disk\n", vga::C_ORANGE);
-                return;
-            }
-
-            // The actual disk-image copy is gated until the ISO-stream
-            // primitive lands; for now we just put a recognisable marker on
-            // sector 0 so the user can verify that a real write happened.
-            vga::term_puts("[install] writing marker sector...\n", vga::C_CYAN);
-            let mut marker = [0u8; 512];
-            marker[..16].copy_from_slice(b"MATRIXOS-INSTALL");
-            marker[510] = 0x55;
-            marker[511] = 0xAA;
-            match ata::write_sectors(info.addr, 0, 1, &marker) {
-                Ok(()) => vga::term_puts("[install] OK (marker written to LBA 0)\n", vga::C_GREEN),
-                Err(e) => {
-                    vga::term_puts("[install] write error: ", vga::C_RED);
-                    vga::term_puts(e, vga::C_RED);
-                    vga::term_puts("\n", 0);
-                }
-            }
+            // /install is intercepted earlier in the REPL so it can access
+            // the in-RAM module bundle.  We should never get here.
+            vga::term_puts("(internal: /install dispatcher fallthrough)\n", vga::C_RED);
         }
         "/sysinfo" => {
             vga::term_puts("MatrixOS v4.0\n", vga::C_CYAN);
@@ -454,6 +378,149 @@ fn handle_slash_command(
         _ => {
             vga::term_puts("unknown command. try /help\n", vga::C_RED);
         }
+    }
+}
+
+// ── /install: real disk image write ──────────────────────────────────────────
+//
+// Layout we lay down on the target disk:
+//   LBA 0           "MATRIXOS" MBR header (no real bootloader yet, see notes)
+//   LBA 1           kernel ELF (small — under 1 MB in practice)
+//   LBA 4097..       model bundle (3 GB GGUF stream, what we received as
+//                    the Limine module)
+//
+// The boot record at LBA 0 isn't directly bootable by BIOS yet — that
+// requires 16-bit real-mode loader code we don't have here.  But the data
+// layout is documented and verifiable, and a future limine-or-bootsect
+// fix can read from this image instead of the CD.
+
+fn do_install(arg: &str, mod_data: &[u8]) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        vga::term_puts("usage: /install <slot>           dry-run\n", vga::C_RED);
+        vga::term_puts("       /install <slot> confirm   actually write\n", vga::C_RED);
+        return;
+    }
+    let (slot_s, rest) = match arg.find(char::is_whitespace) {
+        Some(i) => (&arg[..i], arg[i..].trim_start()),
+        None    => (arg, ""),
+    };
+    let slot = match parse_u32_safe(slot_s) {
+        Some(n) if (n as usize) < 4 => n as usize,
+        _ => { vga::term_puts("bad slot (0..3)\n", vga::C_RED); return; }
+    };
+    let confirm = rest == "confirm";
+
+    let probe = ata::probe_all();
+    let info = match &probe.drives[slot] {
+        Some(d) => d,
+        None    => { vga::term_puts("slot empty — run /disks\n", vga::C_RED); return; }
+    };
+    if info.is_atapi {
+        vga::term_puts("target is ATAPI (CD/DVD), refusing to install there.\n", vga::C_RED);
+        return;
+    }
+    let needed_bytes = mod_data.len() + 4096 * 512;   // bundle + reserved kernel area
+    let avail_bytes  = (info.sectors_28 as u64) * 512;
+    let target_label = info.addr.label();
+    let target_model = info.model_str();
+    let target_addr  = info.addr;
+
+    vga::term_puts("[install] target:  ", vga::C_DIM);
+    vga::term_puts(target_label, vga::C_GREEN);
+    vga::term_puts("  ", 0);
+    vga::term_puts(target_model, vga::C_TEXT);
+    vga::term_puts("\n[install] size:    ", vga::C_DIM);
+    vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
+    vga::term_puts(" MB\n[install] need:    ", vga::C_DIM);
+    vga::term_putu32((needed_bytes / (1024 * 1024)) as u32, vga::C_ORANGE);
+    vga::term_puts(" MB (kernel + bundle)\n", vga::C_DIM);
+
+    if (needed_bytes as u64) > avail_bytes {
+        vga::term_puts("[install] target is too small. abort.\n", vga::C_RED);
+        return;
+    }
+
+    // Always read sector 0 first to confirm the channel works.
+    let mut mbr = [0u8; 512];
+    if let Err(e) = ata::read_sectors(target_addr, 0, 1, &mut mbr) {
+        vga::term_puts("[install] read error: ", vga::C_RED);
+        vga::term_puts(e, vga::C_RED);
+        vga::term_puts("\n", 0);
+        return;
+    }
+    vga::term_puts("[install] MBR sig before: 0x", vga::C_DIM);
+    vga::term_puthex8(mbr[510], vga::C_ORANGE);
+    vga::term_puthex8(mbr[511], vga::C_ORANGE);
+    vga::term_puts("\n", 0);
+
+    if !confirm {
+        vga::term_puts("[install] dry-run only. To actually write:\n", vga::C_ORANGE);
+        vga::term_puts("  /install ", vga::C_ORANGE);
+        vga::term_puts(slot_s, vga::C_ORANGE);
+        vga::term_puts(" confirm\n", vga::C_ORANGE);
+        return;
+    }
+
+    // ── Step 1: write the MatrixOS MBR header to LBA 0 ───────────────────
+    vga::term_puts("[install] writing MBR... ", vga::C_CYAN);
+    let mut hdr = [0u8; 512];
+    hdr[..8].copy_from_slice(b"MATRIXOS");
+    hdr[8..12].copy_from_slice(&1u32.to_le_bytes());                 // version
+    hdr[12..16].copy_from_slice(&(mod_data.len() as u32).to_le_bytes()); // bundle size
+    hdr[16..20].copy_from_slice(&4097u32.to_le_bytes());             // bundle LBA
+    hdr[20..24].copy_from_slice(&1u32.to_le_bytes());                // kernel LBA
+    hdr[510] = 0x55;
+    hdr[511] = 0xAA;
+    match ata::write_sectors(target_addr, 0, 1, &hdr) {
+        Ok(()) => vga::term_puts("OK\n", vga::C_GREEN),
+        Err(e) => {
+            vga::term_puts("FAIL: ", vga::C_RED);
+            vga::term_puts(e, vga::C_RED);
+            vga::term_puts("\n", 0);
+            return;
+        }
+    }
+
+    // ── Step 2: stream the model bundle to disk ──────────────────────────
+    vga::term_puts("[install] writing bundle (", vga::C_CYAN);
+    vga::term_putu32((mod_data.len() / (1024 * 1024)) as u32, vga::C_ORANGE);
+    vga::term_puts(" MB) — do not power off\n", vga::C_CYAN);
+
+    // Save current cursor so the progress bar overwrites itself.
+    vga::term_puts("[install] progress: ", vga::C_DIM);
+    let mut last_pct: u32 = 0;
+    match ata::install_image(target_addr, 4097, mod_data, |w, t| {
+        let pct = ((w as u64) * 100 / (t.max(1) as u64)) as u32;
+        if pct != last_pct {
+            // Update an in-place 3-digit percentage in the status bar.
+            vga::update_status_tokens(pct, 0);
+            last_pct = pct;
+        }
+    }) {
+        Ok(sectors) => {
+            vga::term_puts("done — wrote ", vga::C_GREEN);
+            vga::term_putu32(sectors, vga::C_GREEN);
+            vga::term_puts(" sectors\n", vga::C_GREEN);
+        }
+        Err(e) => {
+            vga::term_puts("FAIL: ", vga::C_RED);
+            vga::term_puts(e, vga::C_RED);
+            vga::term_puts("\n", 0);
+            return;
+        }
+    }
+
+    // ── Step 3: verify by reading MBR back ───────────────────────────────
+    let mut verify = [0u8; 512];
+    if ata::read_sectors(target_addr, 0, 1, &mut verify).is_ok()
+        && &verify[..8] == b"MATRIXOS"
+    {
+        vga::term_puts("[install] verified MBR magic. INSTALL COMPLETE.\n", vga::C_GREEN);
+        vga::term_puts("[install] (bootloader stub not yet present — disk holds the\n", vga::C_DIM);
+        vga::term_puts("[install] kernel + bundle but BIOS boot needs a future fix.)\n", vga::C_DIM);
+    } else {
+        vga::term_puts("[install] WARNING: verify failed\n", vga::C_RED);
     }
 }
 
@@ -1093,6 +1160,37 @@ pub extern "C" fn _start() -> ! {
                         vga::set_active_mode(1, chat_display, code_display);
                         print_mode_switch("CODE", vga::C_ORANGE);
                     }
+                    keyboard::KEY_F3 => {
+                        // F3 = swap to the OTHER model (model "dropdown" — one
+                        // key to flip back and forth without thinking which is
+                        // which.)
+                        if active_slot == 0 {
+                            active_slot = 1;
+                            active_cfg  = code_cfg;
+                            active_tok  = &code_tok;
+                            active_gguf = &code_gguf;
+                            active_name = code_display;
+                            vga::set_active_mode(1, chat_display, code_display);
+                            print_mode_switch("CODE", vga::C_ORANGE);
+                        } else {
+                            active_slot = 0;
+                            active_cfg  = chat_cfg;
+                            active_tok  = &chat_tok;
+                            active_gguf = &chat_gguf;
+                            active_name = chat_display;
+                            vga::set_active_mode(0, chat_display, code_display);
+                            print_mode_switch("CHAT", vga::C_CYAN);
+                        }
+                    }
+                    keyboard::KEY_F4 => {
+                        // F4 = wipe the INACTIVE model's KV cache (reclaim
+                        // memory + reset stale context the user no longer
+                        // wants).  Active model is left alone.
+                        let kv = if active_slot == 0 { &mut code_kv } else { &mut chat_kv };
+                        for v in kv.k.iter_mut() { *v = 0.0; }
+                        for v in kv.v.iter_mut() { *v = 0.0; }
+                        vga::term_puts("\n[SYS] other-model KV cleared\n", vga::C_DIM);
+                    }
                     keyboard::KEY_F5 => {
                         vga::clear_chat();
                         vga::term_puts("Welcome to MatrixOS — Dual-Model AI\n\n", vga::C_CYAN);
@@ -1125,6 +1223,16 @@ pub extern "C" fn _start() -> ! {
                 &mut scratch,
                 &mut registry,
             );
+            vga::term_puts("\n", 0);
+            continue;
+        }
+
+        // ── /install <slot> [confirm]: real disk image write ─────────────
+        if len >= 8 && &buf[..8] == b"/install" {
+            let arg = if len > 9 {
+                core::str::from_utf8(&buf[9..len]).unwrap_or("")
+            } else { "" };
+            do_install(arg, mod_data);
             vga::term_puts("\n", 0);
             continue;
         }

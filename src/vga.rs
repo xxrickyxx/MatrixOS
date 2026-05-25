@@ -419,6 +419,8 @@ pub fn init_gui(info: &SidebarInfo) {
         draw_str_at(sx, sy, "ENTER  send",    C_DIM); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "F1 chat mode",   C_DIM); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "F2 code mode",   C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "F3 swap model",  C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "F4 reset other", C_DIM); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "TAB auto-pick",  C_DIM); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "F5 clear chat",  C_DIM); sy += CHAR_H + 2;
         draw_str_at(sx, sy, "BKSP  delete",   C_DIM);
