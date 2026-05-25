@@ -50,14 +50,16 @@ pub struct App {
     pub name:   String,
     pub recipe: Vec<Cmd>,
     pub author: AppAuthor,
+    pub text:   String,   // original recipe source, kept so we can save/load
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
+#[repr(u32)]
 pub enum AppAuthor {
-    Builtin,
-    AiChat,
-    AiCode,
-    User,
+    Builtin = 0,
+    AiChat  = 1,
+    AiCode  = 2,
+    User    = 3,
 }
 
 impl AppAuthor {
@@ -304,42 +306,17 @@ impl Registry {
     pub const fn new() -> Self { Self { apps: Vec::new() } }
 
     pub fn install_builtins(&mut self) {
-        // Hello
-        self.apps.push(App {
-            name: String::from("hello"),
-            recipe: parse_recipe(
-                "say Hello from MatrixOS!\n\
-                 say Running on $model.\n\
-                 info"
-            ).unwrap_or_default(),
-            author: AppAuthor::Builtin,
-        });
-        // Sysinfo
-        self.apps.push(App {
-            name: String::from("sysinfo"),
-            recipe: parse_recipe(
-                "say --- system info ---\n\
-                 info\n\
-                 nic\n\
-                 usb\n\
-                 tokens\n\
-                 say -------------------"
-            ).unwrap_or_default(),
-            author: AppAuthor::Builtin,
-        });
-        // Ticker (loop demo)
-        self.apps.push(App {
-            name: String::from("tick"),
-            recipe: parse_recipe(
-                "say starting ticker:\n\
-                 loop 5\n\
-                 say   tick $i\n\
-                 pause 2\n\
-                 end\n\
-                 say done."
-            ).unwrap_or_default(),
-            author: AppAuthor::Builtin,
-        });
+        const HELLO: &str = "say Hello from MatrixOS!\nsay Running on $model.\ninfo";
+        const SYSINFO: &str = "say --- system info ---\ninfo\nnic\nusb\ntokens\nsay -------------------";
+        const TICK: &str = "say starting ticker:\nloop 5\nsay   tick $i\npause 2\nend\nsay done.";
+        for (name, text) in [("hello", HELLO), ("sysinfo", SYSINFO), ("tick", TICK)] {
+            self.apps.push(App {
+                name:   String::from(name),
+                recipe: parse_recipe(text).unwrap_or_default(),
+                author: AppAuthor::Builtin,
+                text:   String::from(text),
+            });
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&App> {

@@ -18,6 +18,7 @@ pub mod intent;
 pub mod pci;
 pub mod apps;
 pub mod ata;
+pub mod state;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -218,6 +219,8 @@ fn handle_slash_command(
             vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
             vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
             vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
+            vga::term_puts("  /save              persist apps + settings to disk\n", vga::C_DIM);
+            vga::term_puts("  /load              read saved state from disk\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
             vga::term_puts("Hotkeys: F1 chat · F2 code · TAB toggle auto · F5 clear\n", vga::C_DIM);
         }
@@ -320,10 +323,34 @@ fn handle_slash_command(
         }
         "/sysinfo" => {
             vga::term_puts("MatrixOS v4.0\n", vga::C_CYAN);
+
+            // CPU info from CPUID
+            let mut vendor = [0u8; 12];
+            math::cpu_vendor(&mut vendor);
+            let mut brand  = [0u8; 48];
+            let brand_len  = math::cpu_brand(&mut brand);
+            vga::term_puts("  CPU:     ", vga::C_DIM);
+            if brand_len > 0 {
+                if let Ok(s) = core::str::from_utf8(&brand[..brand_len]) {
+                    vga::term_puts(s.trim(), vga::C_CYAN);
+                }
+            } else if let Ok(s) = core::str::from_utf8(&vendor) {
+                vga::term_puts(s, vga::C_CYAN);
+            }
+            vga::term_puts("\n", 0);
+            vga::term_puts("  ISA:     ", vga::C_DIM);
+            vga::term_puts(if math::avx2_available() {"AVX2+FMA"} else {"SSE3"}, vga::C_GREEN);
+            vga::term_puts("  logical=", vga::C_DIM);
+            vga::term_putu32(math::cpu_logical_count(), vga::C_ORANGE);
+            vga::term_puts("\n", 0);
+
             vga::term_puts("  model:   ", vga::C_DIM); vga::term_puts(model_name, vga::C_CYAN); vga::term_puts("\n", 0);
             vga::term_puts("  d_model: ", vga::C_DIM); vga::term_putu32(d_model, vga::C_ORANGE); vga::term_puts("\n", 0);
             vga::term_puts("  layers:  ", vga::C_DIM); vga::term_putu32(n_layers, vga::C_ORANGE); vga::term_puts("\n", 0);
             vga::term_puts("  tokens:  ", vga::C_DIM); vga::term_putu32(total_tokens, vga::C_CYAN); vga::term_puts("\n", 0);
+            vga::term_puts("  heap:    ", vga::C_DIM);
+            vga::term_putu32(unsafe { (allocator::HEAP_BYTES / (1024*1024)) as u32 }, vga::C_ORANGE);
+            vga::term_puts(" MB\n", vga::C_DIM);
             vga::term_puts("  NIC:     ", vga::C_DIM); vga::term_puts(nic, vga::C_CYAN); vga::term_puts("\n", 0);
             vga::term_puts("  USB:     ", vga::C_DIM); vga::term_puts(usb, vga::C_CYAN); vga::term_puts("\n", 0);
             vga::term_puts("  GPU:     ", vga::C_DIM); vga::term_puts(gpu, vga::C_CYAN); vga::term_puts("\n", 0);
@@ -370,6 +397,36 @@ fn handle_slash_command(
                 }
             } else {
                 vga::term_puts("usage: /set key=value\n", vga::C_RED);
+            }
+        }
+        "/save" => {
+            let settings = state::Settings {
+                max_chat:     *max_new_chat as u32,
+                max_code:     *max_new_code as u32,
+                auto_pick:    *auto_pick,
+                total_tokens,
+            };
+            match state::save(settings, registry) {
+                Ok(()) => vga::term_puts("[save] OK — state persisted to disk LBA 8\n", vga::C_GREEN),
+                Err(e) => {
+                    vga::term_puts("[save] error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                }
+            }
+        }
+        "/load" => {
+            match state::load(registry) {
+                Some(s) => {
+                    *max_new_chat = s.max_chat.clamp(32, 512) as usize;
+                    *max_new_code = s.max_code.clamp(32, 640) as usize;
+                    *auto_pick    = s.auto_pick;
+                    vga::term_puts("[load] OK — settings restored, ", vga::C_GREEN);
+                    let total = registry.list().len() as u32;
+                    vga::term_putu32(total, vga::C_ORANGE);
+                    vga::term_puts(" apps total\n", vga::C_GREEN);
+                }
+                None => vga::term_puts("[load] no saved state on disk (or magic mismatch)\n", vga::C_DIM),
             }
         }
         "/clear" => {
@@ -764,6 +821,7 @@ fn try_create_app_via_ai(
                     name: String::from(name),
                     recipe: cmds,
                     author,
+                    text: recipe_text.clone(),
                 };
                 match registry.register(app) {
                     Ok(()) => {
@@ -1148,6 +1206,16 @@ pub extern "C" fn _start() -> ! {
     // ── Settings the AI agents are allowed to change ──────────────────────
     let mut max_new_chat: usize = 192;   // generous; user wanted longer chats
     let mut max_new_code: usize = 320;
+
+    // Try restoring saved state from disk.  Silently falls through if no
+    // HDD or no valid MATRIXOS-ST magic.
+    if let Some(s) = state::load(&mut registry) {
+        max_new_chat = (s.max_chat as usize).clamp(32, 512);
+        max_new_code = (s.max_code as usize).clamp(32, 640);
+        // total_tokens is per-session, don't restore
+        let _ = s.auto_pick;
+        vga::term_puts("[state] restored apps + settings from disk\n", vga::C_DIM);
+    }
 
     loop {
         vga::term_puts("USER: ", vga::C_USER);

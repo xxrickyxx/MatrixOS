@@ -85,6 +85,101 @@ pub unsafe fn enable_avx() {
     );
 }
 
+/// CPUID leaf 0: 12-byte vendor string (e.g. "GenuineIntel", "AuthenticAMD").
+/// Writes 12 bytes into `out`.
+pub fn cpu_vendor(out: &mut [u8; 12]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let ebx: u32; let ecx: u32; let edx: u32;
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 0",
+            "cpuid",
+            "mov {ebx_o:e}, ebx",
+            "pop rbx",
+            out("eax") _,
+            out("ecx") ecx,
+            out("edx") edx,
+            ebx_o = out(reg) ebx,
+        );
+        out[0..4].copy_from_slice(&ebx.to_le_bytes());
+        out[4..8].copy_from_slice(&edx.to_le_bytes());
+        out[8..12].copy_from_slice(&ecx.to_le_bytes());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = out; }
+}
+
+/// CPUID leaves 0x80000002..4: 48-byte processor brand string.
+/// Writes up to 48 bytes into `out`; returns the actual length used.
+pub fn cpu_brand(out: &mut [u8; 48]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // First confirm leaves 80000002..4 exist.
+        let max_ext: u32;
+        core::arch::asm!(
+            "mov eax, 0x80000000",
+            "cpuid",
+            out("eax") max_ext,
+            out("ecx") _,
+            out("edx") _,
+        );
+        if max_ext < 0x8000_0004 {
+            for b in out.iter_mut() { *b = 0; }
+            return 0;
+        }
+        for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004].iter().enumerate() {
+            let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {ebx_o:e}, ebx",
+                "pop rbx",
+                in("eax") *leaf,
+                out("ecx") ecx,
+                out("edx") edx,
+                lateout("eax") eax,
+                ebx_o = out(reg) ebx,
+            );
+            let base = i * 16;
+            out[base..base + 4].copy_from_slice(&eax.to_le_bytes());
+            out[base + 4..base + 8].copy_from_slice(&ebx.to_le_bytes());
+            out[base + 8..base + 12].copy_from_slice(&ecx.to_le_bytes());
+            out[base + 12..base + 16].copy_from_slice(&edx.to_le_bytes());
+        }
+        // Strip trailing spaces / zeros for length.
+        let mut len = out.len();
+        while len > 0 && (out[len - 1] == 0 || out[len - 1] == b' ') { len -= 1; }
+        len
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = out; 0 }
+}
+
+/// CPUID leaf 1 EBX bits 16..24 = max addressable logical processors per
+/// package (a *rough* core/thread count proxy; not authoritative under
+/// hyperthreading but good enough for a sidebar).
+pub fn cpu_logical_count() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let ebx_v: u32;
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {ebx_o:e}, ebx",
+            "pop rbx",
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            ebx_o = out(reg) ebx_v,
+        );
+        (ebx_v >> 16) & 0xFF
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 1 }
+}
+
 /// Read the x86_64 Time Stamp Counter (TSC).
 /// Used for rough timing; calibration-free (caller divides by ~CPU_HZ).
 #[inline(always)]
