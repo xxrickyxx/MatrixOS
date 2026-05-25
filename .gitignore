@@ -14,6 +14,19 @@ __pycache__/
 *.gguf
 *.bin
 *.safetensors
+*.bundle
+models.bundle
+
+# Build artifacts that don't belong in git (rebuild from src/)
+iso_root/
+matrixos-install.vdi
+*.vdi
+*.vhd
+*.vmdk
+*.ppm
+limine-binary*
+limine.tar.gz
+limine-binary.tar.gz
 
 # OS files
 Thumbs.db
