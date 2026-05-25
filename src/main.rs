@@ -17,6 +17,7 @@ pub mod bundle;
 pub mod intent;
 pub mod pci;
 pub mod apps;
+pub mod ata;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -211,7 +212,8 @@ fn handle_slash_command(
             vga::term_puts("  /apps              list installed apps\n", vga::C_DIM);
             vga::term_puts("  /run <name>        execute an app\n", vga::C_DIM);
             vga::term_puts("  /create <name> <desc>   AI builds the app\n", vga::C_DIM);
-            vga::term_puts("  /disks             list storage controllers\n", vga::C_DIM);
+            vga::term_puts("  /disks             list controllers + IDENTIFY drives\n", vga::C_DIM);
+            vga::term_puts("  /install <slot>    dry-run install probe\n", vga::C_DIM);
             vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
             vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
             vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
@@ -263,30 +265,133 @@ fn handle_slash_command(
             let _ = gpu; let _ = storage;
         }
         "/disks" => {
-            // Walk PCI again so we list every storage controller, not just the
-            // best one stored in the summary.
-            vga::term_puts("Storage controllers detected:\n", vga::C_CYAN);
-            let mut count = 0u32;
+            // Step 1 — controllers from PCI.
+            vga::term_puts("PCI storage controllers:\n", vga::C_CYAN);
+            let mut ctl_count = 0u32;
             pci::enumerate(|d| {
                 if d.is_storage() {
-                    count += 1;
+                    ctl_count += 1;
                     vga::term_puts("  ", 0);
                     vga::term_puts(d.storage_kind(), vga::C_GREEN);
-                    vga::term_puts("   vendor=", vga::C_DIM);
+                    vga::term_puts("   ", vga::C_DIM);
                     vga::term_puthex8((d.vendor_id >> 8) as u8, vga::C_ORANGE);
                     vga::term_puthex8(d.vendor_id as u8, vga::C_ORANGE);
-                    vga::term_puts(" device=", vga::C_DIM);
+                    vga::term_puts(":", vga::C_DIM);
                     vga::term_puthex8((d.device_id >> 8) as u8, vga::C_ORANGE);
                     vga::term_puthex8(d.device_id as u8, vga::C_ORANGE);
                     vga::term_puts("\n", 0);
                 }
             });
-            if count == 0 {
-                vga::term_puts("  (no storage controllers found)\n", vga::C_DIM);
+            if ctl_count == 0 {
+                vga::term_puts("  (none)\n", vga::C_DIM);
+            }
+
+            // Step 2 — actual drives via ATA IDENTIFY.
+            vga::term_puts("\nATA / IDE drives:\n", vga::C_CYAN);
+            let probe = ata::probe_all();
+            let mut idx = 0u32;
+            for (slot, d) in probe.drives.iter().enumerate() {
+                if let Some(info) = d {
+                    vga::term_puts("  [", vga::C_DIM);
+                    vga::term_putu32(slot as u32, vga::C_ORANGE);
+                    vga::term_puts("] ", 0);
+                    vga::term_puts(info.addr.label(), vga::C_GREEN);
+                    vga::term_puts("  ", 0);
+                    vga::term_puts(info.model_str(), vga::C_TEXT);
+                    vga::term_puts("  ", vga::C_DIM);
+                    vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
+                    vga::term_puts(" MB", vga::C_DIM);
+                    if info.is_atapi { vga::term_puts(" [ATAPI]", vga::C_DIM); }
+                    vga::term_puts("\n", 0);
+                    idx += 1;
+                }
+            }
+            if idx == 0 {
+                vga::term_puts("  (no ATA drives responded to IDENTIFY)\n", vga::C_DIM);
+                vga::term_puts("  VirtualBox may need a SATA/IDE disk attached.\n", vga::C_DIM);
             } else {
-                vga::term_puts("Install-to-disk is not implemented yet —\n", vga::C_DIM);
-                vga::term_puts("this is a live ISO. Boot from disk requires a\n", vga::C_DIM);
-                vga::term_puts("future write-driver release.\n", vga::C_DIM);
+                vga::term_puts("Use /install <slot> to install MatrixOS (dry-run).\n", vga::C_DIM);
+            }
+        }
+        "/install" => {
+            if arg.is_empty() {
+                vga::term_puts("usage: /install <slot>   (slot from /disks)\n", vga::C_RED);
+                vga::term_puts("       /install <slot> confirm   to actually write\n", vga::C_RED);
+                return;
+            }
+            // Parse: "<slot>" or "<slot> confirm"
+            let (slot_s, rest) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None    => (arg, ""),
+            };
+            let slot = match parse_u32_safe(slot_s) {
+                Some(n) if (n as usize) < 4 => n as usize,
+                _ => { vga::term_puts("bad slot (0..3)\n", vga::C_RED); return; }
+            };
+            let confirm = rest == "confirm";
+
+            let probe = ata::probe_all();
+            let info = match &probe.drives[slot] {
+                Some(d) => d,
+                None    => { vga::term_puts("slot empty — run /disks\n", vga::C_RED); return; }
+            };
+            if info.is_atapi {
+                vga::term_puts("target is ATAPI (CD/DVD), refusing to install there.\n", vga::C_RED);
+                return;
+            }
+
+            vga::term_puts("[install] target:  ", vga::C_DIM);
+            vga::term_puts(info.addr.label(), vga::C_GREEN);
+            vga::term_puts("  ", 0);
+            vga::term_puts(info.model_str(), vga::C_TEXT);
+            vga::term_puts("\n[install] size:    ", vga::C_DIM);
+            vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
+            vga::term_puts(" MB\n", vga::C_DIM);
+
+            // Demo: read sector 0 (MBR) to prove the driver works.
+            let mut mbr = [0u8; 512];
+            match ata::read_sectors(info.addr, 0, 1, &mut mbr) {
+                Ok(()) => {
+                    vga::term_puts("[install] MBR signature: 0x", vga::C_DIM);
+                    vga::term_puthex8(mbr[510], vga::C_ORANGE);
+                    vga::term_puthex8(mbr[511], vga::C_ORANGE);
+                    if mbr[510] == 0x55 && mbr[511] == 0xAA {
+                        vga::term_puts("  (boot signature present)\n", vga::C_DIM);
+                    } else {
+                        vga::term_puts("  (blank / no MBR)\n", vga::C_DIM);
+                    }
+                }
+                Err(e) => {
+                    vga::term_puts("[install] read error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                    return;
+                }
+            }
+
+            if !confirm {
+                vga::term_puts("[install] dry-run only. Re-run with:\n", vga::C_ORANGE);
+                vga::term_puts("  /install ", vga::C_ORANGE);
+                vga::term_puts(slot_s, vga::C_ORANGE);
+                vga::term_puts(" confirm   ← will WRITE to the disk\n", vga::C_ORANGE);
+                return;
+            }
+
+            // The actual disk-image copy is gated until the ISO-stream
+            // primitive lands; for now we just put a recognisable marker on
+            // sector 0 so the user can verify that a real write happened.
+            vga::term_puts("[install] writing marker sector...\n", vga::C_CYAN);
+            let mut marker = [0u8; 512];
+            marker[..16].copy_from_slice(b"MATRIXOS-INSTALL");
+            marker[510] = 0x55;
+            marker[511] = 0xAA;
+            match ata::write_sectors(info.addr, 0, 1, &marker) {
+                Ok(()) => vga::term_puts("[install] OK (marker written to LBA 0)\n", vga::C_GREEN),
+                Err(e) => {
+                    vga::term_puts("[install] write error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                }
             }
         }
         "/sysinfo" => {
