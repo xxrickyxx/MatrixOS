@@ -124,14 +124,83 @@ pub fn enumerate<F: FnMut(PciDevice)>(mut f: F) {
     }
 }
 
+// ── NIC MAC address reader ────────────────────────────────────────────────────
+
+/// Read a 32-bit value from a memory-mapped I/O address.
+/// Used for register reads from NIC BARs.
+#[inline(always)]
+unsafe fn mmio_read32(addr: u64) -> u32 {
+    core::ptr::read_volatile(addr as *const u32)
+}
+
+impl PciDevice {
+    /// Read the 32-bit BAR at config-space offset `bar_off` (0x10, 0x14, …).
+    /// Returns (base_address, is_memory_bar) — strips the type bits.
+    pub fn read_bar32(&self, bar_off: u8) -> (u64, bool) {
+        let raw = pci_read32(self.bus, self.dev, self.func, bar_off);
+        let is_mem = (raw & 1) == 0;
+        let base = if is_mem { (raw & 0xFFFF_FFF0) as u64 } else { (raw & 0xFFFF_FFFC) as u64 };
+        (base, is_mem)
+    }
+
+    /// Read a 64-bit BAR pair (e.g. 64-bit memory BAR at `bar_off`/`bar_off+4`).
+    pub fn read_bar64(&self, bar_off: u8) -> u64 {
+        let lo = pci_read32(self.bus, self.dev, self.func, bar_off)     & 0xFFFF_FFF0;
+        let hi = pci_read32(self.bus, self.dev, self.func, bar_off + 4) as u64;
+        (hi << 32) | (lo as u64)
+    }
+
+    /// Try to read the NIC's MAC address.
+    ///
+    /// Works for:
+    ///  - Intel e1000/e1000e: RAL0 at BAR0+0x5400, RAH0 at BAR0+0x5404
+    ///  - Virtio-net: reads from BAR0 I/O port (skipped; needs I/O port path)
+    ///
+    /// Returns [u8;6] MAC or all-zero on failure.
+    pub fn read_mac_e1000(&self) -> [u8; 6] {
+        let (bar0, is_mem) = self.read_bar32(0x10);
+        if !is_mem || bar0 == 0 { return [0u8; 6]; }
+
+        // Check for 64-bit BAR (type bits 2:1 == 0b10)
+        let raw_bar0 = pci_read32(self.bus, self.dev, self.func, 0x10);
+        let bar_type = (raw_bar0 >> 1) & 3;
+        let base: u64 = if bar_type == 2 {
+            self.read_bar64(0x10)
+        } else {
+            bar0
+        };
+        if base == 0 { return [0u8; 6]; }
+
+        // e1000: RAL0 = MAC bytes 0-3 (LE), RAH0 = bytes 4-5 (LE) + valid bit
+        // MMIO offset 0x5400 for RAL0, 0x5404 for RAH0
+        unsafe {
+            let ral = mmio_read32(base + 0x5400);
+            let rah = mmio_read32(base + 0x5404);
+            if rah & (1 << 31) == 0 { return [0u8; 6]; } // valid bit not set
+            [
+                (ral        & 0xFF) as u8,
+                ((ral >>  8) & 0xFF) as u8,
+                ((ral >> 16) & 0xFF) as u8,
+                ((ral >> 24) & 0xFF) as u8,
+                (rah        & 0xFF) as u8,
+                ((rah >>  8) & 0xFF) as u8,
+            ]
+        }
+    }
+}
+
+// ── Summary / probe ───────────────────────────────────────────────────────────
+
 /// Summary returned by `probe_summary`.
 pub struct PciSummary {
     pub total_devices: u32,
     pub nic_count:     u32,
     pub first_nic:     Option<PciDevice>,
+    pub nic_mac:       [u8; 6],
 }
 
 /// Scan the bus and return aggregate counts + the first NIC found.
+/// Also attempts to read the NIC's MAC address for Intel e1000.
 pub fn probe_summary() -> PciSummary {
     let mut total = 0u32;
     let mut nics  = 0u32;
@@ -143,5 +212,11 @@ pub fn probe_summary() -> PciSummary {
             if first_nic.is_none() { first_nic = Some(d); }
         }
     });
-    PciSummary { total_devices: total, nic_count: nics, first_nic }
+    let nic_mac = if let Some(ref n) = first_nic {
+        match (n.vendor_id, n.device_id) {
+            (0x8086, 0x100E) | (0x8086, 0x100F) | (0x8086, 0x10D3) => n.read_mac_e1000(),
+            _ => [0u8; 6],
+        }
+    } else { [0u8; 6] };
+    PciSummary { total_devices: total, nic_count: nics, first_nic, nic_mac }
 }

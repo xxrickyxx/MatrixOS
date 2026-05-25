@@ -179,6 +179,15 @@ pub extern "C" fn _start() -> ! {
         let label = n.nic_model();
         vga::term_puts("[OK] NIC: ", vga::C_GREEN);
         vga::term_puts(label, vga::C_CYAN);
+        // Show MAC if we got one (non-zero)
+        let mac = &pci.nic_mac;
+        if mac.iter().any(|&b| b != 0) {
+            vga::term_puts("  MAC:", vga::C_DIM);
+            for (i, &b) in mac.iter().enumerate() {
+                if i > 0 { vga::term_putc(b':', vga::C_DIM); }
+                vga::term_puthex8(b, vga::C_CYAN);
+            }
+        }
         vga::term_puts("\n", 0);
         label
     } else {
@@ -417,6 +426,9 @@ pub extern "C" fn _start() -> ! {
         let mut tok_buf = [0u8; 32];
         let mut turn_tokens: u32 = 0;
 
+        // TSC-based timing — rough tok/s estimate (assumes ~3 GHz CPU)
+        let tsc_start = math::rdtsc();
+
         let max_new: usize = if active_slot == 0 { 96 } else { 160 };
         model::generate(
             active_gguf,
@@ -440,12 +452,23 @@ pub extern "C" fn _start() -> ! {
                     vga::term_putc(b' ', 0);
                 }
                 if total_tokens % 4 == 0 {
-                    vga::update_status_tokens(total_tokens);
+                    vga::update_status_tokens(total_tokens, 0);
                 }
             },
         );
 
-        vga::update_status_tokens(total_tokens);
+        // Compute approximate tok/s: Δtsc / 3_000_000_000 ≈ seconds elapsed
+        let tsc_end  = math::rdtsc();
+        let delta    = tsc_end.wrapping_sub(tsc_start);
+        // 3 GHz → 3e9 ticks/s; avoid division by zero
+        let toks_per_sec: u32 = if delta > 0 && turn_tokens > 0 {
+            // tok/s = turn_tokens / (delta / 3e9) = turn_tokens * 3e9 / delta
+            // Use u64 to avoid overflow
+            let num = (turn_tokens as u64).saturating_mul(3_000_000_000u64);
+            (num / delta) as u32
+        } else { 0 };
+
+        vga::update_status_tokens(total_tokens, toks_per_sec);
         vga::term_puts("\n\n", 0);
     }
 }

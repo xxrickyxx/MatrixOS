@@ -492,22 +492,33 @@ pub fn clear_chat() {
     }
 }
 
-/// Update the status bar token count.
-pub fn update_status_tokens(n: u32) {
+/// Update the status bar token count + optional tok/s rate.
+/// `toks_per_sec == 0` means "not yet measured, keep previous rate".
+pub fn update_status_tokens(n: u32, toks_per_sec: u32) {
     unsafe {
         TOK_COUNT = n;
         if FB_PTR.is_null() { return; }
         let h      = FB_HEIGHT;
         let w      = FB_WIDTH;
         let sbar_y = h.saturating_sub(STATUS_H);
-        // Clear the token area
-        let tok_x = w.saturating_sub(120);
-        fill_rect(tok_x, sbar_y + 1, 118, STATUS_H - 2, C_HDR);
-        // Draw "Tok: NNNN"
+        // Clear the token+rate area (right 220px)
+        let tok_x = w.saturating_sub(220);
+        fill_rect(tok_x, sbar_y + 1, 218, STATUS_H - 2, C_HDR);
+
+        // "Tok: NNNN  ~XX t/s"
         draw_str_at(tok_x, sbar_y + 4, "Tok:", C_DIM);
         let mut b = [0u8; 8];
         let s = u32_to_str(n, &mut b);
         draw_str_at(tok_x + 5*CHAR_W, sbar_y + 4, s, C_GREEN);
+
+        if toks_per_sec > 0 {
+            let rate_x = tok_x + 11*CHAR_W;
+            draw_str_at(rate_x, sbar_y + 4, "~", C_DIM);
+            let mut rb = [0u8; 8];
+            let rs = u32_to_str(toks_per_sec, &mut rb);
+            draw_str_at(rate_x + CHAR_W, sbar_y + 4, rs, C_CYAN);
+            draw_str_at(rate_x + CHAR_W + rs.len() * CHAR_W, sbar_y + 4, "t/s", C_DIM);
+        }
     }
 }
 
@@ -617,6 +628,13 @@ pub fn term_putu32(n: u32, color: u32) {
     let mut buf = [0u8; 10];
     let s = u32_to_str(n, &mut buf);
     term_puts(s, color);
+}
+
+/// Print a single byte as two hex digits (e.g. 0xAB → "AB").
+pub fn term_puthex8(b: u8, color: u32) {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    term_putc(HEX[(b >> 4) as usize], color);
+    term_putc(HEX[(b & 0xF) as usize], color);
 }
 
 pub fn term_newline() { term_putc(b'\n', 0); }

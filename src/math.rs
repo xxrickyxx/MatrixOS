@@ -1,12 +1,87 @@
-/// Matrix-vector multiply: out[i] = dot(vec, mat_row[i])
-pub fn mat_mul_vec(out: &mut [f32], vec: &[f32], mat: &[f32]) {
+// ── Hardware-accelerated primitives ──────────────────────────────────────────
+
+/// Read the x86_64 Time Stamp Counter (TSC).
+/// Used for rough timing; calibration-free (caller divides by ~CPU_HZ).
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
+/// SSE3 horizontal-add helper: returns a[0]+a[1]+a[2]+a[3].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse3")]
+#[inline]
+unsafe fn hsum_sse(v: core::arch::x86_64::__m128) -> f32 {
+    use core::arch::x86_64::*;
+    let h1 = _mm_hadd_ps(v, v);
+    let h2 = _mm_hadd_ps(h1, h1);
+    _mm_cvtss_f32(h2)
+}
+
+/// SSE dot product of two equal-length f32 slices.
+/// Falls back to scalar for the remainder (n % 4 ≠ 0) elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse3")]
+unsafe fn dot_sse(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n      = a.len().min(b.len());
+    let chunks = n / 4;
+    let mut acc = _mm_setzero_ps();
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    for i in 0..chunks {
+        let av = _mm_loadu_ps(ap.add(i * 4));
+        let bv = _mm_loadu_ps(bp.add(i * 4));
+        // FMA not assumed; plain mul+add is universal
+        acc = _mm_add_ps(acc, _mm_mul_ps(av, bv));
+    }
+    let mut sum = hsum_sse(acc);
+    for i in (chunks * 4)..n {
+        sum += *ap.add(i) * *bp.add(i);
+    }
+    sum
+}
+
+/// SSE matrix-vector multiply: out[i] = Σ vec[j]*mat[i*cols+j]
+/// Each row dot is vectorised with SSE3 (4-wide f32).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse3")]
+unsafe fn mat_mul_vec_sse(out: &mut [f32], vec: &[f32], mat: &[f32]) {
     let rows = out.len();
     let cols = vec.len();
     for i in 0..rows {
-        let mut s = 0.0f32;
-        let off   = i * cols;
-        for j in 0..cols { s += vec[j] * mat[off + j]; }
-        out[i] = s;
+        let row = core::slice::from_raw_parts(mat.as_ptr().add(i * cols), cols);
+        out[i] = dot_sse(vec, row);
+    }
+}
+
+/// Matrix-vector multiply: out[i] = dot(vec, mat_row[i])
+/// Uses SSE3 SIMD on x86_64 (4× f32 per cycle), scalar fallback otherwise.
+pub fn mat_mul_vec(out: &mut [f32], vec: &[f32], mat: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: target JSON has +sse3; enable_sse() runs before any inference.
+        unsafe { mat_mul_vec_sse(out, vec, mat); }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let rows = out.len();
+        let cols = vec.len();
+        for i in 0..rows {
+            let mut s = 0.0f32;
+            let off   = i * cols;
+            for j in 0..cols { s += vec[j] * mat[off + j]; }
+            out[i] = s;
+        }
     }
 }
 
@@ -71,13 +146,20 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + fast_exp(-x))
 }
 
-/// Dot product.
-#[inline(always)]
+/// Dot product — SSE3-accelerated on x86_64, scalar fallback otherwise.
+#[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let mut s = 0.0f32;
-    for i in 0..n { s += a[i] * b[i]; }
-    s
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { dot_sse(a, b) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let n = a.len().min(b.len());
+        let mut s = 0.0f32;
+        for i in 0..n { s += a[i] * b[i]; }
+        s
+    }
 }
 
 /// Copy src → dst.
