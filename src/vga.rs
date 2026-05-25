@@ -254,7 +254,21 @@ pub struct SidebarInfo<'a> {
     pub head_dim:      u32,
     pub ffn_dim:       u32,
     pub vocab:         u32,
+    // Multi-model fields. If only one is loaded, chat_name == code_name == model_name.
+    pub chat_name:     &'a str,
+    pub code_name:     &'a str,
+    pub active_slot:   u8,        // 0 = chat, 1 = code
+    pub nic_info:      &'a str,
 }
+
+// Remember screen positions of the model labels so we can repaint just
+// the active highlight when the user hits F1/F2.
+pub static mut MODE_CHAT_X: usize = 0;
+pub static mut MODE_CHAT_Y: usize = 0;
+pub static mut MODE_CODE_X: usize = 0;
+pub static mut MODE_CODE_Y: usize = 0;
+pub static mut MODE_CHAT_LEN: usize = 0;
+pub static mut MODE_CODE_LEN: usize = 0;
 
 pub fn init_terminal(fb: *mut u8, pitch: usize, bpp: usize, width: usize, height: usize) {
     unsafe {
@@ -308,11 +322,32 @@ pub fn init_gui(info: &SidebarInfo) {
         let sx = 10usize;
         let mut sy = HDR_H + 12;
 
-        // ─ MODEL ─
+        // ─ MODELS ─ (two slots, current one highlighted)
         draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
-        draw_str_at(sx, sy, "MODEL", C_CYAN);
+        draw_str_at(sx, sy, "MODELS", C_CYAN);
         sy += 20;
-        draw_str_at(sx, sy, info.model_name, C_TEXT); sy += CHAR_H + 2;
+        // Chat slot
+        let chat_color = if info.active_slot == 0 { C_GREEN } else { C_DIM };
+        let chat_mark  = if info.active_slot == 0 { ">" } else { " " };
+        draw_str_at(sx, sy, chat_mark, chat_color);
+        draw_str_at(sx + 2*CHAR_W, sy, "CHAT", C_CYAN);
+        sy += CHAR_H;
+        MODE_CHAT_X   = sx + 2*CHAR_W;
+        MODE_CHAT_Y   = sy;
+        MODE_CHAT_LEN = info.chat_name.len();
+        draw_str_at(sx + 2*CHAR_W, sy, info.chat_name, chat_color); sy += CHAR_H + 4;
+        // Code slot
+        let code_color = if info.active_slot == 1 { C_GREEN } else { C_DIM };
+        let code_mark  = if info.active_slot == 1 { ">" } else { " " };
+        draw_str_at(sx, sy, code_mark, code_color);
+        draw_str_at(sx + 2*CHAR_W, sy, "CODE", C_ORANGE);
+        sy += CHAR_H;
+        MODE_CODE_X   = sx + 2*CHAR_W;
+        MODE_CODE_Y   = sy;
+        MODE_CODE_LEN = info.code_name.len();
+        draw_str_at(sx + 2*CHAR_W, sy, info.code_name, code_color); sy += CHAR_H + 6;
+        // Active model details follow
+        draw_str_at(sx, sy, "ACTIVE", C_CYAN); sy += CHAR_H + 2;
         draw_str_at(sx, sy, info.quant,      C_ORANGE); sy += CHAR_H + 2;
 
         // tensors label
@@ -365,16 +400,19 @@ pub fn init_gui(info: &SidebarInfo) {
         draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
         draw_str_at(sx, sy, "SYSTEM", C_CYAN); sy += 20;
         draw_str_at(sx, sy, "Heap:  20 MB",  C_TEXT); sy += CHAR_H + 2;
-        draw_str_at(sx, sy, "KV:   ~14 MB",  C_TEXT); sy += CHAR_H + 2;
-        draw_str_at(sx, sy, "ISA:  SSE4.2",  C_TEXT); sy += CHAR_H + 8;
+        draw_str_at(sx, sy, "ISA:  SSE4.2",  C_TEXT); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "NIC:", C_DIM);
+        draw_str_at(sx + 5*CHAR_W, sy, info.nic_info, C_TEXT); sy += CHAR_H + 8;
 
         // ─ CONTROLS ─
         draw_hline(sx, sy + 10, SIDE_W - sx - 6, C_BORDER2);
         draw_str_at(sx, sy, "CONTROLS", C_CYAN); sy += 20;
-        draw_str_at(sx, sy, "ENTER  send",   C_DIM); sy += CHAR_H + 2;
-        draw_str_at(sx, sy, "BKSP   delete", C_DIM); sy += CHAR_H + 2;
-        draw_str_at(sx, sy, "Slow on bare",  C_DIM); sy += CHAR_H;
-        draw_str_at(sx, sy, "metal — wait!", C_ORANGE);
+        draw_str_at(sx, sy, "ENTER  send",    C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "F1 chat mode",   C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "F2 code mode",   C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "TAB auto-pick",  C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "F5 clear chat",  C_DIM); sy += CHAR_H + 2;
+        draw_str_at(sx, sy, "BKSP  delete",   C_DIM);
 
         // ── Status bar ───────────────────────────────────────────────────────
         let sbar_y = h.saturating_sub(STATUS_H);
@@ -403,6 +441,52 @@ pub fn init_gui(info: &SidebarInfo) {
         TERM_TOP    = chat_top;
         TERM_RIGHT  = chat_right;
         TERM_BOTTOM = chat_bottom;
+        CUR_X = 0;
+        CUR_Y = 0;
+    }
+}
+
+/// Re-paint the sidebar's CHAT/CODE highlights when the active model
+/// changes at runtime (F1/F2 hotkeys).
+pub fn set_active_mode(slot: u8, chat_name: &str, code_name: &str) {
+    unsafe {
+        if FB_PTR.is_null() { return; }
+        let sx = 10usize;
+        // Repaint the chat row
+        let chat_color = if slot == 0 { C_GREEN } else { C_DIM };
+        let chat_mark  = if slot == 0 { ">" } else { " " };
+        let chat_y     = MODE_CHAT_Y - CHAR_H;
+        // Clear marker column
+        fill_rect(sx, chat_y, CHAR_W, CHAR_H, C_SIDE);
+        draw_str_at(sx, chat_y, chat_mark, chat_color);
+        // Repaint chat name row
+        let row_w = SIDE_W.saturating_sub(MODE_CHAT_X + 4);
+        fill_rect(MODE_CHAT_X, MODE_CHAT_Y, row_w, CHAR_H, C_SIDE);
+        draw_str_at(MODE_CHAT_X, MODE_CHAT_Y, chat_name, chat_color);
+
+        // Repaint the code row
+        let code_color = if slot == 1 { C_GREEN } else { C_DIM };
+        let code_mark  = if slot == 1 { ">" } else { " " };
+        let code_y     = MODE_CODE_Y - CHAR_H;
+        fill_rect(sx, code_y, CHAR_W, CHAR_H, C_SIDE);
+        draw_str_at(sx, code_y, code_mark, code_color);
+        let row_w2 = SIDE_W.saturating_sub(MODE_CODE_X + 4);
+        fill_rect(MODE_CODE_X, MODE_CODE_Y, row_w2, CHAR_H, C_SIDE);
+        draw_str_at(MODE_CODE_X, MODE_CODE_Y, code_name, code_color);
+    }
+}
+
+/// Wipe the chat-area scrollback to a blank screen, repaint the input row.
+pub fn clear_chat() {
+    unsafe {
+        if FB_PTR.is_null() { return; }
+        let left   = TERM_LEFT;
+        let top    = TERM_TOP;
+        let right  = TERM_RIGHT.min(FB_WIDTH);
+        let bottom = TERM_BOTTOM.min(FB_HEIGHT);
+        if right > left && bottom > top {
+            fill_rect(left, top, right - left, bottom - top, C_BG);
+        }
         CUR_X = 0;
         CUR_Y = 0;
     }

@@ -13,6 +13,9 @@ pub mod tokenizer;
 pub mod math;
 pub mod model;
 pub mod quant;
+pub mod bundle;
+pub mod intent;
+pub mod pci;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -52,11 +55,15 @@ fn delay() {
 
 // ── GUI-aware keyboard line reader ────────────────────────────────────────────
 
-/// Blocking read into `buf` with live GUI input-box rendering.
-/// Returns number of bytes typed (without the newline).
-fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
+/// Result of read_line_gui: either a finished line (Enter), or a hotkey.
+enum LineEvent {
+    Line(usize),         // line len in buf
+    Hotkey(char),
+}
+
+fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
     let mut len = 0usize;
-    vga::draw_input_line(buf, len);   // show empty box + cursor initially
+    vga::draw_input_line(buf, len);
 
     loop {
         let sc = loop {
@@ -64,13 +71,15 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
             unsafe { core::arch::asm!("pause"); }
         };
 
-        if sc & 0x80 != 0 { continue; }   // ignore key-release events
+        // Note: shift make/break IS handled inside scancode_to_char now.
+        // Ignore non-shift releases.
+        if sc & 0x80 != 0 && sc != 0xAA && sc != 0xB6 { continue; }
 
         if let Some(ch) = kb.scancode_to_char(sc) {
             match ch {
                 '\n' => {
-                    vga::draw_input_line(&[], 0);   // clear input box
-                    break;
+                    vga::draw_input_line(&[], 0);
+                    return LineEvent::Line(len);
                 }
                 '\x08' => {
                     if len > 0 {
@@ -78,8 +87,15 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
                         vga::draw_input_line(buf, len);
                     }
                 }
+                // F-keys / TAB / ESC: bubble up as hotkeys
+                c if (c as u32) < 0x20 && c != '\n' && c != '\x08'
+                    || c == keyboard::KEY_TAB
+                    || c == keyboard::KEY_ESC => {
+                    vga::draw_input_line(&[], 0);
+                    return LineEvent::Hotkey(c);
+                }
                 c => {
-                    if len < buf.len() - 1 {
+                    if len < buf.len() - 1 && (c as u32) < 128 {
                         buf[len] = c as u8;
                         len += 1;
                         vga::draw_input_line(buf, len);
@@ -88,7 +104,14 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> usize {
             }
         }
     }
-    len
+}
+
+// ── Helpers for switching active model slot ──────────────────────────────────
+
+fn print_mode_switch(name: &str, color: u32) {
+    vga::term_puts("\n[SYS] switched to ", vga::C_DIM);
+    vga::term_puts(name, color);
+    vga::term_puts("\n", 0);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -117,16 +140,15 @@ pub extern "C" fn _start() -> ! {
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
-    // Init terminal to full-screen for the boot log
     vga::init_terminal(fb_ptr, pitch, bpp, fb_w, fb_h);
     delay();
 
-    vga::term_puts("MATRIXOS v3.0  --  BARE-METAL LLM OS\n", vga::C_GREEN);
-    vga::term_puts("Boot sequence starting...\n", vga::C_DIM);
+    vga::term_puts("MATRIXOS v4.0 — DUAL-MODEL BARE-METAL LLM\n", vga::C_GREEN);
+    vga::term_puts("Boot sequence...\n", vga::C_DIM);
 
     // ── Stage 1: hardware ────────────────────────────────────────────────
     unsafe { enable_sse(); core::arch::asm!("cli"); }
-    vga::term_puts("[OK] SSE/AVX enabled\n", vga::C_GREEN);
+    vga::term_puts("[OK] SSE enabled\n", vga::C_GREEN);
 
     unsafe { idt::init(); }
     vga::term_puts("[OK] IDT loaded\n", vga::C_GREEN);
@@ -138,7 +160,7 @@ pub extern "C" fn _start() -> ! {
 
     // ── Stage 2: heap ───────────────────────────────────────────────────
     allocator::init();
-    vga::term_puts("[OK] Heap online (20 MB)\n", vga::C_GREEN);
+    vga::term_puts("[OK] Heap online (64 MB)\n", vga::C_GREEN);
 
     // ── Stage 3: HHDM ───────────────────────────────────────────────────
     match HHDM_REQUEST.response() {
@@ -146,12 +168,28 @@ pub extern "C" fn _start() -> ! {
         None    => vga::term_puts("[WARN] HHDM unavailable\n", vga::C_ORANGE),
     };
 
-    // ── Stage 4: GGUF module ─────────────────────────────────────────────
-    vga::term_puts("[..] Loading GGUF module...\n", vga::C_CYAN);
+    // ── Stage 4: PCI scan ────────────────────────────────────────────────
+    let pci = pci::probe_summary();
+    vga::term_puts("[OK] PCI devices: ", vga::C_GREEN);
+    vga::term_putu32(pci.total_devices, vga::C_ORANGE);
+    vga::term_puts(", NICs: ", vga::C_GREEN);
+    vga::term_putu32(pci.nic_count, vga::C_ORANGE);
+    vga::term_puts("\n", 0);
+    let nic_label: &str = if let Some(n) = pci.first_nic {
+        let label = n.nic_model();
+        vga::term_puts("[OK] NIC: ", vga::C_GREEN);
+        vga::term_puts(label, vga::C_CYAN);
+        vga::term_puts("\n", 0);
+        label
+    } else {
+        "none"
+    };
 
-    let gguf_data: &[u8] = match MODULE_REQUEST.response() {
+    // ── Stage 5: Load Limine module ──────────────────────────────────────
+    vga::term_puts("[..] Loading model module...\n", vga::C_CYAN);
+    let mod_data: &[u8] = match MODULE_REQUEST.response() {
         None => {
-            vga::term_puts("[FATAL] No module request response\n", vga::C_RED);
+            vga::term_puts("[FATAL] No module response\n", vga::C_RED);
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
         Some(res) => {
@@ -160,161 +198,253 @@ pub extern "C" fn _start() -> ! {
                 vga::term_puts("[FATAL] No module in ISO\n", vga::C_RED);
                 loop { unsafe { core::arch::asm!("hlt"); } }
             }
-            let m = &mods[0];
-            m.data()  // Limine already provides HHDM-mapped virtual address
+            mods[0].data()
         }
     };
 
-    // Verify GGUF magic
-    if gguf_data.len() < 4 || &gguf_data[0..4] != b"GGUF" {
-        vga::term_puts("[FATAL] Not a valid GGUF file\n", vga::C_RED);
+    // Detect bundle vs single GGUF
+    let (chat_bytes, chat_name_buf, code_bytes, code_name_buf, is_bundle) =
+        if let Some(b) = bundle::Bundle::parse(mod_data) {
+            vga::term_puts("[OK] Bundle detected: ", vga::C_GREEN);
+            vga::term_putu32(b.count as u32, vga::C_ORANGE);
+            vga::term_puts(" models\n", 0);
+            let m0 = b.get(0).expect("model 0");
+            let m1 = b.get(1).unwrap_or(m0);
+            (m0.data, m0.name, m1.data, m1.name, true)
+        } else {
+            vga::term_puts("[OK] Single GGUF module\n", vga::C_GREEN);
+            // Treat the same module as both slots
+            (mod_data, "model", mod_data, "model", false)
+        };
+
+    if chat_bytes.len() < 4 || &chat_bytes[0..4] != b"GGUF" {
+        vga::term_puts("[FATAL] Chat slot is not GGUF\n", vga::C_RED);
+        loop { unsafe { core::arch::asm!("hlt"); } }
+    }
+    if code_bytes.len() < 4 || &code_bytes[0..4] != b"GGUF" {
+        vga::term_puts("[FATAL] Code slot is not GGUF\n", vga::C_RED);
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
-    let gguf = match gguf::Gguf::new(gguf_data) {
-        None    => { vga::term_puts("[FATAL] GGUF parse failed\n", vga::C_RED); loop { unsafe { core::arch::asm!("hlt"); } } }
-        Some(g) => g,
-    };
+    let chat_gguf = gguf::Gguf::new(chat_bytes).expect("parse chat");
+    let code_gguf = gguf::Gguf::new(code_bytes).expect("parse code");
 
-    vga::term_puts("[OK] GGUF parsed. Tensors: ", vga::C_GREEN);
-    vga::term_putu32(gguf.header.tensor_count as u32, vga::C_ORANGE);
+    let chat_cfg = model::load_config_from_gguf(&chat_gguf);
+    let code_cfg = model::load_config_from_gguf(&code_gguf);
+
+    vga::term_puts("[OK] Chat ", vga::C_GREEN);
+    vga::term_puts(chat_name_buf, vga::C_CYAN);
+    vga::term_puts(": d=", vga::C_DIM);
+    vga::term_putu32(chat_cfg.d_model as u32, vga::C_ORANGE);
+    vga::term_puts(" L=", vga::C_DIM);
+    vga::term_putu32(chat_cfg.n_layers as u32, vga::C_ORANGE);
     vga::term_puts("\n", 0);
 
-    // ── Stage 5: Load config + tokenizer ─────────────────────────────────
-    let cfg = model::load_config_from_gguf(&gguf);
-    vga::term_puts("[OK] Config: d=", vga::C_GREEN);
-    vga::term_putu32(cfg.d_model as u32, vga::C_ORANGE);
-    vga::term_puts(" L=", vga::C_GREEN);
-    vga::term_putu32(cfg.n_layers as u32, vga::C_ORANGE);
-    vga::term_puts(" H=", vga::C_GREEN);
-    vga::term_putu32(cfg.n_heads as u32, vga::C_ORANGE);
-    vga::term_puts(" KV=", vga::C_GREEN);
-    vga::term_putu32(cfg.n_kv_heads as u32, vga::C_ORANGE);
-    vga::term_puts(" hd=", vga::C_GREEN);
-    vga::term_putu32(cfg.head_dim as u32, vga::C_ORANGE);
-    vga::term_puts(" ff=", vga::C_GREEN);
-    vga::term_putu32(cfg.ffn_dim as u32, vga::C_ORANGE);
+    vga::term_puts("[OK] Code ", vga::C_GREEN);
+    vga::term_puts(code_name_buf, vga::C_CYAN);
+    vga::term_puts(": d=", vga::C_DIM);
+    vga::term_putu32(code_cfg.d_model as u32, vga::C_ORANGE);
+    vga::term_puts(" L=", vga::C_DIM);
+    vga::term_putu32(code_cfg.n_layers as u32, vga::C_ORANGE);
     vga::term_puts("\n", 0);
 
-    let tokenizer = match tokenizer::Tokenizer::from_gguf(&gguf) {
-        None    => { vga::term_puts("[WARN] Tokenizer not found\n", vga::C_ORANGE); None }
-        Some(t) => {
-            vga::term_puts("[OK] Tokenizer: vocab=", vga::C_GREEN);
-            vga::term_putu32(t.count as u32, vga::C_ORANGE);
-            vga::term_puts("\n", 0);
-            Some(t)
-        }
-    };
+    let chat_tok = tokenizer::Tokenizer::from_gguf(&chat_gguf);
+    let code_tok = tokenizer::Tokenizer::from_gguf(&code_gguf);
 
-    // ── Stage 6: Allocate KV cache + scratch ─────────────────────────────
+    // ── Stage 6: Allocate KV caches + shared scratch ────────────────────
     const MAX_SEQ: usize = 128;
+    vga::term_puts("[..] Allocating KV caches...\n", vga::C_CYAN);
+    let mut chat_kv = model::KVCache::new(chat_cfg.n_layers, chat_cfg.n_kv_heads,
+                                          chat_cfg.head_dim, MAX_SEQ);
+    let mut code_kv = model::KVCache::new(code_cfg.n_layers, code_cfg.n_kv_heads,
+                                          code_cfg.head_dim, MAX_SEQ);
+    vga::term_puts("[OK] KV caches ready\n", vga::C_GREEN);
 
-    vga::term_puts("[..] Allocating KV cache...\n", vga::C_CYAN);
-    let mut kv = model::KVCache::new(cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, MAX_SEQ);
-    vga::term_puts("[OK] KV cache ready\n", vga::C_GREEN);
-
-    vga::term_puts("[..] Allocating scratch buffers...\n", vga::C_CYAN);
-    let mut scratch = model::ForwardScratch::new(&cfg, MAX_SEQ);
+    // Build a max-config so the shared scratch fits both models
+    let max_cfg = model::ModelConfig {
+        d_model:    chat_cfg.d_model.max(code_cfg.d_model),
+        n_layers:   chat_cfg.n_layers.max(code_cfg.n_layers),
+        n_heads:    chat_cfg.n_heads.max(code_cfg.n_heads),
+        n_kv_heads: chat_cfg.n_kv_heads.max(code_cfg.n_kv_heads),
+        head_dim:   chat_cfg.head_dim.max(code_cfg.head_dim),
+        ffn_dim:    chat_cfg.ffn_dim.max(code_cfg.ffn_dim),
+        vocab_size: chat_cfg.vocab_size.max(code_cfg.vocab_size),
+        rope_freq:  chat_cfg.rope_freq,
+        bos:        chat_cfg.bos,
+        eos:        chat_cfg.eos,
+    };
+    let mut scratch = model::ForwardScratch::new(&max_cfg, MAX_SEQ);
     vga::term_puts("[OK] Scratch ready. Launching GUI...\n", vga::C_GREEN);
 
-    // ── Stage 7: Switch to GUI ────────────────────────────────────────────
-    // Gather model name from GGUF (or use default)
-    let model_name: &str = if let Some(gguf::GgufValue::String(n)) = gguf.find_metadata("general.name") {
-        n
+    // ── Stage 7: GUI ──────────────────────────────────────────────────────
+    let chat_display: &str = if is_bundle {
+        chat_name_buf
     } else {
-        "Qwen2.5-7B"
+        // Use general.name from the GGUF
+        if let Some(gguf::GgufValue::String(n)) = chat_gguf.find_metadata("general.name") { n }
+        else { "qwen2.5" }
     };
+    let code_display: &str = if is_bundle {
+        code_name_buf
+    } else { chat_display };
 
-    let vocab_count = tokenizer.as_ref().map(|t| t.count as u32).unwrap_or(cfg.vocab_size as u32);
+    let mut active_slot: u8 = 0;     // 0 = chat, 1 = code
+    let mut active_cfg = chat_cfg;
+    let mut active_tok = &chat_tok;
+    let mut active_gguf = &chat_gguf;
+    let mut active_name = chat_display;
 
     let sidebar = vga::SidebarInfo {
-        model_name,
-        quant:      "Q4_K_M",
-        n_tensors:  gguf.header.tensor_count as u32,
-        d_model:    cfg.d_model as u32,
-        n_layers:   cfg.n_layers as u32,
-        n_heads:    cfg.n_heads as u32,
-        n_kv_heads: cfg.n_kv_heads as u32,
-        head_dim:   cfg.head_dim as u32,
-        ffn_dim:    cfg.ffn_dim as u32,
-        vocab:      vocab_count,
+        model_name:  chat_display,
+        quant:       "Q4_K_M",
+        n_tensors:   chat_gguf.header.tensor_count as u32,
+        d_model:     chat_cfg.d_model as u32,
+        n_layers:    chat_cfg.n_layers as u32,
+        n_heads:     chat_cfg.n_heads as u32,
+        n_kv_heads:  chat_cfg.n_kv_heads as u32,
+        head_dim:    chat_cfg.head_dim as u32,
+        ffn_dim:     chat_cfg.ffn_dim as u32,
+        vocab:       chat_tok.as_ref().map(|t| t.count as u32).unwrap_or(chat_cfg.vocab_size as u32),
+        chat_name:   chat_display,
+        code_name:   code_display,
+        active_slot: 0,
+        nic_info:    nic_label,
     };
     vga::init_gui(&sidebar);
 
-    // Welcome message in the chat area
-    vga::term_puts("Welcome to MatrixOS — Bare-Metal AI\n", vga::C_CYAN);
-    vga::term_puts("Type a question and press ENTER.\n", vga::C_DIM);
-    vga::term_puts("(First response may take 1-2 min)\n\n", vga::C_DIM);
+    vga::term_puts("Welcome to MatrixOS — Dual-Model AI\n", vga::C_CYAN);
+    vga::term_puts("F1 chat · F2 code · TAB auto-pick\n", vga::C_DIM);
+    vga::term_puts("F5 clear chat · type and ENTER\n\n", vga::C_DIM);
 
-    // ── Stage 8: Interactive REPL ─────────────────────────────────────────
-    let mut kb  = keyboard::Keyboard::new();
-    let mut buf = [0u8; 256];
+    // ── Stage 8: REPL ─────────────────────────────────────────────────────
+    let mut kb       = keyboard::Keyboard::new();
+    let mut buf      = [0u8; 256];
     let mut total_tokens: u32 = 0;
+    let mut auto_pick = true;   // TAB toggles
 
     loop {
-        // Echo USER label into chat area, then read from GUI input box
         vga::term_puts("USER: ", vga::C_USER);
-        let len = read_line_gui(&mut kb, &mut buf);
+        let event = read_line_gui(&mut kb, &mut buf);
+        let len = match event {
+            LineEvent::Line(n) => n,
+            LineEvent::Hotkey(k) => {
+                match k {
+                    keyboard::KEY_F1 => {
+                        active_slot = 0;
+                        active_cfg  = chat_cfg;
+                        active_tok  = &chat_tok;
+                        active_gguf = &chat_gguf;
+                        active_name = chat_display;
+                        vga::set_active_mode(0, chat_display, code_display);
+                        print_mode_switch("CHAT", vga::C_CYAN);
+                    }
+                    keyboard::KEY_F2 => {
+                        active_slot = 1;
+                        active_cfg  = code_cfg;
+                        active_tok  = &code_tok;
+                        active_gguf = &code_gguf;
+                        active_name = code_display;
+                        vga::set_active_mode(1, chat_display, code_display);
+                        print_mode_switch("CODE", vga::C_ORANGE);
+                    }
+                    keyboard::KEY_F5 => {
+                        vga::clear_chat();
+                        vga::term_puts("Welcome to MatrixOS — Dual-Model AI\n\n", vga::C_CYAN);
+                    }
+                    keyboard::KEY_TAB => {
+                        auto_pick = !auto_pick;
+                        vga::term_puts("\n[SYS] auto-pick ", vga::C_DIM);
+                        vga::term_puts(if auto_pick {"ON"} else {"OFF"}, vga::C_GREEN);
+                        vga::term_puts("\n", 0);
+                    }
+                    _ => {}
+                }
+                let _ = active_name;  // suppress unused-warning churn
+                continue;
+            }
+        };
         if len == 0 { continue; }
 
-        // Echo typed text + newline into chat area
+        // Echo user line
         for i in 0..len { vga::term_putc(buf[i], vga::C_TEXT); }
         vga::term_putc(b'\n', 0);
 
+        // Auto-pick: maybe switch slot based on intent before responding
+        if auto_pick {
+            let (chosen, _score) = intent::classify(&buf[..len]);
+            let want_slot: u8 = match chosen { intent::Mode::Chat => 0, intent::Mode::Code => 1 };
+            if want_slot != active_slot {
+                active_slot = want_slot;
+                if want_slot == 0 {
+                    active_cfg  = chat_cfg;
+                    active_tok  = &chat_tok;
+                    active_gguf = &chat_gguf;
+                    active_name = chat_display;
+                } else {
+                    active_cfg  = code_cfg;
+                    active_tok  = &code_tok;
+                    active_gguf = &code_gguf;
+                    active_name = code_display;
+                }
+                vga::set_active_mode(active_slot, chat_display, code_display);
+                vga::term_puts("[auto→", vga::C_DIM);
+                vga::term_puts(if active_slot==0 {"CHAT"} else {"CODE"},
+                               if active_slot==0 {vga::C_CYAN} else {vga::C_ORANGE});
+                vga::term_puts("] ", vga::C_DIM);
+            }
+        }
+
         let user_text = core::str::from_utf8(&buf[..len]).unwrap_or("?");
 
-        // AI response prefix
-        vga::term_puts("AI:   ", vga::C_AI);
+        // AI prefix (color depends on mode)
+        let ai_color = if active_slot==0 { vga::C_AI } else { vga::C_ORANGE };
+        vga::term_puts("AI:   ", ai_color);
 
-        // Tokenize using ChatML format
+        // Tokenize
         let mut prompt_tokens: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-        if let Some(ref tok) = tokenizer {
+        if let Some(ref tok) = *active_tok {
             tok.build_chat_prompt(user_text, &mut prompt_tokens);
         } else {
             for &b in user_text.as_bytes() { prompt_tokens.push(b as u32); }
         }
 
-        // Reset KV cache for new conversation turn
-        for v in kv.k.iter_mut() { *v = 0.0; }
-        for v in kv.v.iter_mut() { *v = 0.0; }
+        // Reset the ACTIVE model's KV cache (not the other one — preserve its
+        // unrelated context so future switches feel snappy)
+        let kv_ref = if active_slot == 0 { &mut chat_kv } else { &mut code_kv };
+        for v in kv_ref.k.iter_mut() { *v = 0.0; }
+        for v in kv_ref.v.iter_mut() { *v = 0.0; }
 
-        // Generate response — tokens printed as they arrive
-        let tok_ref = &tokenizer;
         let mut tok_buf = [0u8; 32];
         let mut turn_tokens: u32 = 0;
 
+        let max_new: usize = if active_slot == 0 { 96 } else { 160 };
         model::generate(
-            &gguf,
-            &cfg,
-            &mut kv,
+            active_gguf,
+            &active_cfg,
+            kv_ref,
             &mut scratch,
             &prompt_tokens,
-            64, // max new tokens per turn
+            max_new,
             |token_id| {
                 turn_tokens += 1;
                 total_tokens += 1;
-
-                // Decode and print the token
-                if let Some(ref t) = *tok_ref {
+                if let Some(ref t) = *active_tok {
                     if let Some(s) = t.get_token(token_id as usize) {
                         let n = tokenizer::decode_token_to_buf(s, &mut tok_buf);
                         for i in 0..n {
-                            vga::term_putc(tok_buf[i], vga::C_AI);
+                            vga::term_putc(tok_buf[i], ai_color);
                         }
                     }
                 } else {
-                    vga::term_putu32(token_id, vga::C_AI);
+                    vga::term_putu32(token_id, ai_color);
                     vga::term_putc(b' ', 0);
                 }
-
-                // Update status bar token counter every 8 tokens to reduce overhead
-                if total_tokens % 8 == 0 {
+                if total_tokens % 4 == 0 {
                     vga::update_status_tokens(total_tokens);
                 }
             },
         );
 
-        // Final token count update
         vga::update_status_tokens(total_tokens);
         vga::term_puts("\n\n", 0);
     }

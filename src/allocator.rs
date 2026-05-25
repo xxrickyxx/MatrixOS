@@ -1,7 +1,10 @@
 use core::mem::MaybeUninit;
 use linked_list_allocator::LockedHeap;
 
-const HEAP_SIZE: usize = 20 * 1024 * 1024;
+// 64 MB heap — enough for two KV caches (~10 MB each), the shared
+// forward scratch (~10 MB), tokenization buffers, and headroom for
+// runtime Vec allocations.  Still fits comfortably in the 8 GB VM.
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
