@@ -330,5 +330,19 @@ impl Registry {
         Ok(())
     }
 
+    /// Remove an app by name.  Refuses to delete built-ins so the user can
+    /// never end up with a registry missing the default tools.
+    pub fn delete(&mut self, name: &str) -> Result<(), &'static str> {
+        let idx = match self.apps.iter().position(|a| a.name == name) {
+            Some(i) => i,
+            None    => return Err("no such app"),
+        };
+        if matches!(self.apps[idx].author, AppAuthor::Builtin) {
+            return Err("cannot delete a built-in app");
+        }
+        self.apps.remove(idx);
+        Ok(())
+    }
+
     pub fn list(&self) -> &[App] { &self.apps }
 }

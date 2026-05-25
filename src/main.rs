@@ -214,6 +214,8 @@ fn handle_slash_command(
             vga::term_puts("  /apps              list installed apps\n", vga::C_DIM);
             vga::term_puts("  /run <name>        execute an app\n", vga::C_DIM);
             vga::term_puts("  /create <name> <desc>   AI builds the app\n", vga::C_DIM);
+            vga::term_puts("  /show <name>       print recipe source\n", vga::C_DIM);
+            vga::term_puts("  /delete <name>     remove a non-builtin app\n", vga::C_DIM);
             vga::term_puts("  /disks             list controllers + IDENTIFY drives\n", vga::C_DIM);
             vga::term_puts("  /install <slot>    dry-run install probe\n", vga::C_DIM);
             vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
@@ -435,6 +437,48 @@ fn handle_slash_command(
             vga::term_puts(" s  TSC=", vga::C_DIM);
             vga::term_putu32((hz / 1_000_000) as u32, vga::C_ORANGE);
             vga::term_puts(" MHz\n", vga::C_DIM);
+        }
+        "/delete" => {
+            if arg.is_empty() {
+                vga::term_puts("usage: /delete <app-name>\n", vga::C_RED);
+                return;
+            }
+            match registry.delete(arg) {
+                Ok(()) => {
+                    vga::term_puts("[delete] removed: ", vga::C_GREEN);
+                    vga::term_puts(arg, vga::C_GREEN);
+                    vga::term_puts("\n", 0);
+                }
+                Err(e) => {
+                    vga::term_puts("[delete] error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                }
+            }
+        }
+        "/show" => {
+            if arg.is_empty() {
+                vga::term_puts("usage: /show <app-name>\n", vga::C_RED);
+                return;
+            }
+            match registry.find(arg) {
+                Some(app) => {
+                    vga::term_puts("--- ", vga::C_DIM);
+                    vga::term_puts(&app.name, vga::C_GREEN);
+                    vga::term_puts(" (", vga::C_DIM);
+                    vga::term_puts(app.author.label(), vga::C_DIM);
+                    vga::term_puts(") ---\n", vga::C_DIM);
+                    for &b in app.text.as_bytes() {
+                        vga::term_putc(b, vga::C_TEXT);
+                    }
+                    vga::term_puts("\n--- end ---\n", vga::C_DIM);
+                }
+                None => {
+                    vga::term_puts("no such app: ", vga::C_RED);
+                    vga::term_puts(arg, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                }
+            }
         }
         "/save" => {
             let settings = state::Settings {
