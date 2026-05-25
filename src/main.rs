@@ -24,6 +24,52 @@ use core::panic::PanicInfo;
 use limine::request::{FramebufferRequest, ModulesRequest, HhdmRequest};
 use limine::BaseRevision;
 
+// ── Bare-metal `mem*` intrinsics ─────────────────────────────────────────────
+// rustc/LLVM emit calls to memset/memcpy/memmove/memcmp for slice ops and
+// `core::ptr::write_bytes`.  Without `compiler_builtins` mem feature on a
+// no_std target these symbols are missing — the linker happily resolves them
+// to address 0 (or wherever the .got points), which is what caused the
+// "orange screen" boot hang.  Providing them explicitly fixes that.
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dst: *mut u8, val: i32, count: usize) -> *mut u8 {
+    let v = val as u8;
+    let mut i = 0usize;
+    while i < count { *dst.add(i) = v; i += 1; }
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    let mut i = 0usize;
+    while i < count { *dst.add(i) = *src.add(i); i += 1; }
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    if (dst as usize) < (src as usize) {
+        let mut i = 0usize;
+        while i < count { *dst.add(i) = *src.add(i); i += 1; }
+    } else {
+        let mut i = count;
+        while i > 0 { i -= 1; *dst.add(i) = *src.add(i); }
+    }
+    dst
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, count: usize) -> i32 {
+    let mut i = 0usize;
+    while i < count {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b { return a as i32 - b as i32; }
+        i += 1;
+    }
+    0
+}
+
 #[used] #[link_section = ".requests"]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used] #[link_section = ".requests"]
@@ -114,6 +160,24 @@ fn print_mode_switch(name: &str, color: u32) {
     vga::term_puts("\n", 0);
 }
 
+/// Draw a 20×20 sentinel rectangle in the top-right area. Each stage uses a
+/// different X so a row of colored squares forms as boot progresses. If the
+/// row is short, we know which stage hung.
+#[inline(never)]
+unsafe fn stage_marker(fb: *mut u8, pitch: usize, bpp: usize, fb_w: usize,
+                       stage: usize, r: u8, g: u8, b: u8) {
+    if fb.is_null() { return; }
+    let sx = fb_w.saturating_sub(20 * 14) + stage * 22;
+    for py in 4..24usize {
+        for px in 0..20usize {
+            let off = py * pitch + (sx + px) * bpp;
+            *fb.add(off)     = b;
+            *fb.add(off + 1) = g;
+            *fb.add(off + 2) = r;
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -132,26 +196,51 @@ pub extern "C" fn _start() -> ! {
             bpp    = fb.bpp   as usize / 8;
             fb_w   = fb.width  as usize;
             fb_h   = fb.height as usize;
-            let sz = pitch * fb_h;
-            for i in 0..sz { unsafe { *fb_ptr.add(i) = 0; } }
+            // IMPORTANT: do NOT use core::ptr::write_bytes / 1D byte loop here.
+            // LLVM compiles those to a memset call that this kernel has no
+            // working implementation of (compiler_builtins memset fails on
+            // bare-metal MB-sized clears, leaving an undefined screen — that
+            // was the cause of the original "orange screen" boot hang).
+            // The explicit 2D BGR loop below isn't recognised as memset and
+            // is reliable.
+            for y in 0..fb_h {
+                for x in 0..fb_w {
+                    let off = y * pitch + x * bpp;
+                    unsafe {
+                        *fb_ptr.add(off)     = 0x00; // B
+                        *fb_ptr.add(off + 1) = 0x00; // G
+                        *fb_ptr.add(off + 2) = 0x00; // R
+                    }
+                }
+            }
         }
     }
     if fb_ptr.is_null() {
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
+    // Marker 0: framebuffer cleared OK (green) — proves color format
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 0, 0x00, 0xFF, 0x00); }
+
     vga::init_terminal(fb_ptr, pitch, bpp, fb_w, fb_h);
+
+    // Marker 1: init_terminal OK (cyan)
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 1, 0x00, 0xFF, 0xFF); }
     delay();
 
     vga::term_puts("MATRIXOS v4.0 — DUAL-MODEL BARE-METAL LLM\n", vga::C_GREEN);
     vga::term_puts("Boot sequence...\n", vga::C_DIM);
+    // Marker 2: first term_puts call returned (yellow) — proves draw_char works
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 2, 0xFF, 0xFF, 0x00); }
 
     // ── Stage 1: hardware ────────────────────────────────────────────────
     unsafe { enable_sse(); core::arch::asm!("cli"); }
     vga::term_puts("[OK] SSE enabled\n", vga::C_GREEN);
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 3, 0xFF, 0x80, 0x00); }
 
     unsafe { idt::init(); }
     vga::term_puts("[OK] IDT loaded\n", vga::C_GREEN);
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 4, 0xFF, 0x00, 0xFF); }
 
     if !BASE_REVISION.is_supported() {
         vga::term_puts("[FATAL] Limine revision not supported\n", vga::C_RED);
@@ -161,15 +250,26 @@ pub extern "C" fn _start() -> ! {
     // ── Stage 2: heap ───────────────────────────────────────────────────
     allocator::init();
     vga::term_puts("[OK] Heap online (64 MB)\n", vga::C_GREEN);
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 5, 0x80, 0x80, 0xFF); }
 
     // ── Stage 3: HHDM ───────────────────────────────────────────────────
-    match HHDM_REQUEST.response() {
-        Some(_) => vga::term_puts("[OK] HHDM mapped\n", vga::C_GREEN),
-        None    => vga::term_puts("[WARN] HHDM unavailable\n", vga::C_ORANGE),
+    let hhdm_offset: u64 = match HHDM_REQUEST.response() {
+        Some(r) => {
+            vga::term_puts("[OK] HHDM mapped\n", vga::C_GREEN);
+            r.offset
+        }
+        None => {
+            vga::term_puts("[WARN] HHDM unavailable\n", vga::C_ORANGE);
+            0
+        }
     };
 
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 6, 0x40, 0xFF, 0x80); }
+
     // ── Stage 4: PCI scan ────────────────────────────────────────────────
-    let pci = pci::probe_summary();
+    // hhdm_offset = 0 makes the MAC reader skip MMIO (boot-safe).
+    let pci = pci::probe_summary(hhdm_offset);
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 7, 0xFF, 0xC0, 0xC0); }
     vga::term_puts("[OK] PCI devices: ", vga::C_GREEN);
     vga::term_putu32(pci.total_devices, vga::C_ORANGE);
     vga::term_puts(", NICs: ", vga::C_GREEN);
@@ -193,6 +293,8 @@ pub extern "C" fn _start() -> ! {
     } else {
         "none"
     };
+
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 8, 0xC0, 0xFF, 0xFF); }
 
     // ── Stage 5: Load Limine module ──────────────────────────────────────
     vga::term_puts("[..] Loading model module...\n", vga::C_CYAN);
@@ -235,11 +337,15 @@ pub extern "C" fn _start() -> ! {
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
 
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 9, 0xC0, 0xC0, 0xFF); }
     let chat_gguf = gguf::Gguf::new(chat_bytes).expect("parse chat");
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 10, 0xFF, 0xFF, 0xFF); }
     let code_gguf = gguf::Gguf::new(code_bytes).expect("parse code");
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 11, 0x00, 0xC0, 0xC0); }
 
     let chat_cfg = model::load_config_from_gguf(&chat_gguf);
     let code_cfg = model::load_config_from_gguf(&code_gguf);
+    unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 12, 0xFF, 0x40, 0x40); }
 
     vga::term_puts("[OK] Chat ", vga::C_GREEN);
     vga::term_puts(chat_name_buf, vga::C_CYAN);
@@ -477,16 +583,22 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    vga::emergency_fill(0x3D0000);
+    // MAGENTA = panic (distinct from any normal-boot color)
+    vga::emergency_fill(0xFF00FF);
     unsafe {
         if !vga::FB_PTR.is_null() {
             vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
-                             20, 20, "!!! KERNEL PANIC !!!", 0xFF4444);
+                             20, 20, "!!! KERNEL PANIC !!!", 0xFFFFFF);
             vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
-                             20, 44, "MatrixOS halted", 0xC9D1D9);
+                             20, 44, "MatrixOS halted", 0xFFFFFF);
             if let Some(loc) = info.location() {
+                // Bound the file-path draw to avoid the corruption pattern when
+                // loc.file() returns a wild pointer (this is what produced the
+                // "orange screen" before).
+                let f = loc.file();
+                let safe = if f.len() > 80 { &f[..80] } else { f };
                 vga::draw_string(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
-                                 20, 68, loc.file(), 0xE3B341);
+                                 20, 68, safe, 0xFFFFFF);
                 vga::draw_hex(vga::FB_PTR, vga::FB_PITCH, vga::FB_BPP,
                               20, 92, loc.line() as u64, 0xFFFFFF);
             }

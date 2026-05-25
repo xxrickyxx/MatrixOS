@@ -152,39 +152,54 @@ impl PciDevice {
 
     /// Try to read the NIC's MAC address.
     ///
-    /// Works for:
-    ///  - Intel e1000/e1000e: RAL0 at BAR0+0x5400, RAH0 at BAR0+0x5404
-    ///  - Virtio-net: reads from BAR0 I/O port (skipped; needs I/O port path)
+    /// `hhdm_offset` is Limine's higher-half direct map offset: the BAR's
+    /// physical address must be translated to virtual (phys + hhdm) before
+    /// dereferencing, otherwise we'd hit an unmapped page and triple-fault.
+    /// If `hhdm_offset == 0` we skip the read and return zeros.
     ///
+    /// Works for Intel e1000/e1000e: RAL0 at BAR0+0x5400, RAH0 at BAR0+0x5404.
     /// Returns [u8;6] MAC or all-zero on failure.
-    pub fn read_mac_e1000(&self) -> [u8; 6] {
+    pub fn read_mac_e1000(&self, hhdm_offset: u64) -> [u8; 6] {
+        if hhdm_offset == 0 { return [0u8; 6]; }
+
         let (bar0, is_mem) = self.read_bar32(0x10);
         if !is_mem || bar0 == 0 { return [0u8; 6]; }
 
         // Check for 64-bit BAR (type bits 2:1 == 0b10)
         let raw_bar0 = pci_read32(self.bus, self.dev, self.func, 0x10);
         let bar_type = (raw_bar0 >> 1) & 3;
-        let base: u64 = if bar_type == 2 {
+        let base_phys: u64 = if bar_type == 2 {
             self.read_bar64(0x10)
         } else {
             bar0
         };
-        if base == 0 { return [0u8; 6]; }
+        if base_phys == 0 { return [0u8; 6]; }
+        // Sanity: typical BARs are below 4 GiB or in the FE/FF range. Reject
+        // anything that looks like a Limine virtual address already.
+        if base_phys >= 0x0000_8000_0000_0000 { return [0u8; 6]; }
+
+        // Translate physical → HHDM virtual.
+        let base = base_phys.wrapping_add(hhdm_offset);
 
         // e1000: RAL0 = MAC bytes 0-3 (LE), RAH0 = bytes 4-5 (LE) + valid bit
-        // MMIO offset 0x5400 for RAL0, 0x5404 for RAH0
         unsafe {
             let ral = mmio_read32(base + 0x5400);
             let rah = mmio_read32(base + 0x5404);
-            if rah & (1 << 31) == 0 { return [0u8; 6]; } // valid bit not set
-            [
+            // RAH valid bit may not be set in some virtualised NICs; accept
+            // any non-broadcast, non-zero MAC.
+            let mac = [
                 (ral        & 0xFF) as u8,
                 ((ral >>  8) & 0xFF) as u8,
                 ((ral >> 16) & 0xFF) as u8,
                 ((ral >> 24) & 0xFF) as u8,
                 (rah        & 0xFF) as u8,
                 ((rah >>  8) & 0xFF) as u8,
-            ]
+            ];
+            // Reject all-0xFF (no device) and all-0x00 (invalid).
+            if mac.iter().all(|&b| b == 0xFF) || mac.iter().all(|&b| b == 0) {
+                return [0u8; 6];
+            }
+            mac
         }
     }
 }
@@ -200,8 +215,9 @@ pub struct PciSummary {
 }
 
 /// Scan the bus and return aggregate counts + the first NIC found.
-/// Also attempts to read the NIC's MAC address for Intel e1000.
-pub fn probe_summary() -> PciSummary {
+/// Also attempts to read the NIC's MAC address for Intel e1000 via HHDM-mapped MMIO.
+/// Pass 0 for `hhdm_offset` to skip the MAC read (boot-safe fallback).
+pub fn probe_summary(hhdm_offset: u64) -> PciSummary {
     let mut total = 0u32;
     let mut nics  = 0u32;
     let mut first_nic: Option<PciDevice> = None;
@@ -214,7 +230,7 @@ pub fn probe_summary() -> PciSummary {
     });
     let nic_mac = if let Some(ref n) = first_nic {
         match (n.vendor_id, n.device_id) {
-            (0x8086, 0x100E) | (0x8086, 0x100F) | (0x8086, 0x10D3) => n.read_mac_e1000(),
+            (0x8086, 0x100E) | (0x8086, 0x100F) | (0x8086, 0x10D3) => n.read_mac_e1000(hhdm_offset),
             _ => [0u8; 6],
         }
     } else { [0u8; 6] };
