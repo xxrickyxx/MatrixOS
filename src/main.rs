@@ -19,6 +19,7 @@ pub mod pci;
 pub mod apps;
 pub mod ata;
 pub mod state;
+pub mod net;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -81,6 +82,10 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 static MODULE_REQUEST: ModulesRequest = ModulesRequest::new();
 #[used] #[link_section = ".requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+/// HHDM offset cached after boot — read by slash commands that need to
+/// translate physical addresses (e.g. NIC MMIO BARs) into kernel virtual.
+static mut HHDM_OFFSET: u64 = 0;
 
 // ── SSE enablement ────────────────────────────────────────────────────────────
 
@@ -224,6 +229,7 @@ fn handle_slash_command(
             vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
             vga::term_puts("  /save              persist apps + settings to disk\n", vga::C_DIM);
             vga::term_puts("  /load              read saved state from disk\n", vga::C_DIM);
+            vga::term_puts("  /net [reset]       NIC info / link state / soft-reset\n", vga::C_DIM);
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
@@ -273,9 +279,11 @@ fn handle_slash_command(
             let _ = gpu; let _ = storage;
         }
         "/disks" => {
-            // Step 1 — controllers from PCI.
+            // Step 1 — every PCI storage controller (IDE / SATA / NVMe / RAID).
             vga::term_puts("PCI storage controllers:\n", vga::C_CYAN);
             let mut ctl_count = 0u32;
+            let mut ahci_count = 0u32;
+            let mut nvme_count = 0u32;
             pci::enumerate(|d| {
                 if d.is_storage() {
                     ctl_count += 1;
@@ -287,14 +295,22 @@ fn handle_slash_command(
                     vga::term_puts(":", vga::C_DIM);
                     vga::term_puthex8((d.device_id >> 8) as u8, vga::C_ORANGE);
                     vga::term_puthex8(d.device_id as u8, vga::C_ORANGE);
+                    if d.subclass == 0x06 { ahci_count += 1; vga::term_puts("  (AHCI)", vga::C_ORANGE); }
+                    if d.subclass == 0x08 { nvme_count += 1; vga::term_puts("  (NVMe)", vga::C_ORANGE); }
                     vga::term_puts("\n", 0);
                 }
             });
             if ctl_count == 0 {
                 vga::term_puts("  (none)\n", vga::C_DIM);
             }
+            if ahci_count > 0 || nvme_count > 0 {
+                vga::term_puts("  note: AHCI / NVMe controllers are NOT yet driven —\n", vga::C_ORANGE);
+                vga::term_puts("  drives behind them won't appear below.  Use the legacy\n", vga::C_DIM);
+                vga::term_puts("  IDE controller in your VM settings.\n", vga::C_DIM);
+            }
 
-            // Step 2 — actual drives via ATA IDENTIFY.
+            // Step 2 — actual drives via ATA IDENTIFY on the legacy IDE
+            // controllers (primary 0x1F0, secondary 0x170, master+slave each).
             vga::term_puts("\nATA / IDE drives:\n", vga::C_CYAN);
             let probe = ata::probe_all();
             let mut idx = 0u32;
@@ -306,17 +322,34 @@ fn handle_slash_command(
                     vga::term_puts(info.addr.label(), vga::C_GREEN);
                     vga::term_puts("  ", 0);
                     vga::term_puts(info.model_str(), vga::C_TEXT);
-                    vga::term_puts("  ", vga::C_DIM);
-                    vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
-                    vga::term_puts(" MB", vga::C_DIM);
                     if info.is_atapi { vga::term_puts(" [ATAPI]", vga::C_DIM); }
+                    vga::term_puts("\n      sectors: ", vga::C_DIM);
+                    vga::term_putu32(info.total_sectors() as u32, vga::C_ORANGE);
+                    vga::term_puts("  size: ", vga::C_DIM);
+                    let gb_x10 = info.capacity_gb_x10();
+                    if gb_x10 >= 10 {
+                        vga::term_putu32(gb_x10 / 10, vga::C_ORANGE);
+                        vga::term_putc(b'.', vga::C_DIM);
+                        vga::term_putu32(gb_x10 % 10, vga::C_ORANGE);
+                        vga::term_puts(" GB", vga::C_DIM);
+                    } else {
+                        vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
+                        vga::term_puts(" MB", vga::C_DIM);
+                    }
+                    vga::term_puts("  LBA: ", vga::C_DIM);
+                    vga::term_puts(if info.sectors_48 > 0 {"48-bit"} else {"28-bit"}, vga::C_GREEN);
                     vga::term_puts("\n", 0);
                     idx += 1;
                 }
             }
             if idx == 0 {
                 vga::term_puts("  (no ATA drives responded to IDENTIFY)\n", vga::C_DIM);
-                vga::term_puts("  VirtualBox may need a SATA/IDE disk attached.\n", vga::C_DIM);
+                if ahci_count > 0 {
+                    vga::term_puts("  VM controller is AHCI — switch to legacy IDE in VirtualBox\n", vga::C_ORANGE);
+                    vga::term_puts("  (Settings -> Storage -> Controller: IDE, attach disk to it).\n", vga::C_ORANGE);
+                } else {
+                    vga::term_puts("  Attach an IDE hard disk in the VM settings.\n", vga::C_DIM);
+                }
             } else {
                 vga::term_puts("Use /install <slot> to install MatrixOS (dry-run).\n", vga::C_DIM);
             }
@@ -402,6 +435,60 @@ fn handle_slash_command(
                 }
             } else {
                 vga::term_puts("usage: /set key=value\n", vga::C_RED);
+            }
+        }
+        "/net" => {
+            let hhdm = unsafe { HHDM_OFFSET };
+            let do_reset = arg == "reset";
+            match net::probe(hhdm) {
+                Some(mut nic) => {
+                    vga::term_puts("NIC: ", vga::C_CYAN);
+                    vga::term_puts(nic.addr.nic_model(), vga::C_GREEN);
+                    vga::term_puts("\n  MAC:   ", vga::C_DIM);
+                    for (i, &b) in nic.mac.iter().enumerate() {
+                        if i > 0 { vga::term_putc(b':', vga::C_DIM); }
+                        vga::term_puthex8(b, vga::C_CYAN);
+                    }
+                    vga::term_puts("\n  BAR0:  0x", vga::C_DIM);
+                    // print high+low 32-bit halves
+                    vga::term_puthex8((nic.mmio_phys >> 56) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >> 48) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >> 40) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >> 32) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >> 24) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >> 16) as u8, vga::C_ORANGE);
+                    vga::term_puthex8((nic.mmio_phys >>  8) as u8, vga::C_ORANGE);
+                    vga::term_puthex8( nic.mmio_phys        as u8, vga::C_ORANGE);
+                    vga::term_puts("\n  link:  ", vga::C_DIM);
+                    if nic.link_up {
+                        vga::term_puts("UP", vga::C_GREEN);
+                        vga::term_puts("  ", 0);
+                        vga::term_putu32(nic.speed_mbps, vga::C_ORANGE);
+                        vga::term_puts(" Mbps", vga::C_DIM);
+                        vga::term_puts(if nic.full_duplex {" full-dup\n"} else {" half-dup\n"}, vga::C_DIM);
+                    } else {
+                        vga::term_puts("DOWN", vga::C_RED);
+                        vga::term_puts(" (cable / VM NAT may not provide link state)\n", vga::C_DIM);
+                    }
+                    if do_reset {
+                        vga::term_puts("  resetting controller...\n", vga::C_CYAN);
+                        unsafe { net::soft_reset(&nic); }
+                        // Re-probe to see post-reset state.
+                        if let Some(after) = net::probe(hhdm) {
+                            nic = after;
+                            vga::term_puts("  post-reset link: ", vga::C_DIM);
+                            vga::term_puts(if nic.link_up {"UP\n"} else {"DOWN\n"},
+                                           if nic.link_up {vga::C_GREEN} else {vga::C_RED});
+                        }
+                    } else {
+                        vga::term_puts("  hint: /net reset  to issue CTRL.RST\n", vga::C_DIM);
+                    }
+                    vga::term_puts("  (TX/RX rings + packet send: future PR)\n", vga::C_DIM);
+                }
+                None => {
+                    vga::term_puts("No e1000-class NIC found, or HHDM unavailable.\n", vga::C_RED);
+                    vga::term_puts("Run /sysinfo to see what NIC the PCI scan reported.\n", vga::C_DIM);
+                }
             }
         }
         "/meminfo" => {
@@ -906,9 +993,33 @@ fn try_create_app_via_ai(
                 };
                 match registry.register(app) {
                     Ok(()) => {
-                        vga::term_puts("[done] app registered. /run ", vga::C_GREEN);
-                        vga::term_puts(name, vga::C_GREEN);
-                        vga::term_puts(" to execute.\n", vga::C_GREEN);
+                        vga::term_puts("[done] app registered.\n", vga::C_GREEN);
+
+                        // ── Auto-test: immediately run the registered app
+                        //    so the user sees if it actually works, instead
+                        //    of having to remember to /run it.  This is the
+                        //    "iterate until done" UX the user asked for:
+                        //    register + execute + show output in one shot.
+                        if let Some(app) = registry.find(name) {
+                            vga::term_puts("[test] auto-running ", vga::C_CYAN);
+                            vga::term_puts(name, vga::C_GREEN);
+                            vga::term_puts(":\n", vga::C_CYAN);
+                            let ctx = apps::RuntimeCtx {
+                                total_tokens: 0,
+                                tsc: math::rdtsc(),
+                                nic: "auto-test",
+                                usb: "auto-test",
+                                model_name: name,
+                                d_model: 0,
+                                n_layers: 0,
+                            };
+                            apps::run_recipe(&app.recipe, &ctx);
+                            vga::term_puts("[test] done. /show ", vga::C_CYAN);
+                            vga::term_puts(name, vga::C_GREEN);
+                            vga::term_puts(" to see the recipe,  /delete ", vga::C_CYAN);
+                            vga::term_puts(name, vga::C_GREEN);
+                            vga::term_puts(" to remove.\n", vga::C_CYAN);
+                        }
                     }
                     Err(e) => {
                         vga::term_puts("[fail] register: ", vga::C_RED);
@@ -1069,6 +1180,7 @@ pub extern "C" fn _start() -> ! {
             0
         }
     };
+    unsafe { HHDM_OFFSET = hhdm_offset; }
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 5, 0x80, 0x80, 0xFF); }
 
     // ── Stage 3: heap (allocate from Limine memmap, NOT static BSS) ─────

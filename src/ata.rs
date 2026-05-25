@@ -151,15 +151,29 @@ pub struct DriveInfo {
 }
 
 impl DriveInfo {
+    /// Total sectors — picks LBA-48 when present, otherwise LBA-28.
+    /// Many virtual disks (VirtualBox, QEMU) report only LBA-28 even for >128 GB
+    /// drives, so this is the value to trust for capacity.
+    pub fn total_sectors(&self) -> u64 {
+        if self.sectors_48 > 0 { self.sectors_48 } else { self.sectors_28 as u64 }
+    }
     pub fn capacity_mb(&self) -> u32 {
-        let s = if self.sectors_48 > 0 { self.sectors_48 } else { self.sectors_28 as u64 };
-        ((s * 512) / (1024 * 1024)) as u32
+        ((self.total_sectors() * 512) / (1024 * 1024)) as u32
+    }
+    pub fn capacity_gb_x10(&self) -> u32 {
+        // GB × 10 so the caller can format "X.Y GB" without floats
+        ((self.total_sectors() * 512 * 10) / (1024 * 1024 * 1024)) as u32
     }
     pub fn model_str(&self) -> &str {
         // Find end of trailing whitespace
         let mut end = self.model.len();
         while end > 0 && (self.model[end - 1] == b' ' || self.model[end - 1] == 0) { end -= 1; }
         core::str::from_utf8(&self.model[..end]).unwrap_or("?")
+    }
+    pub fn serial_str(&self) -> &str {
+        let mut end = self.serial.len();
+        while end > 0 && (self.serial[end - 1] == b' ' || self.serial[end - 1] == 0) { end -= 1; }
+        core::str::from_utf8(&self.serial[..end]).unwrap_or("?")
     }
 }
 

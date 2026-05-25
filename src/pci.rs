@@ -25,7 +25,7 @@ unsafe fn inl(port: u16) -> u32 {
 }
 
 /// Read a 32-bit value from PCI config space.
-fn pci_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+pub fn pci_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
     let addr: u32 = 0x8000_0000
         | ((bus  as u32) << 16)
         | ((dev  as u32) << 11)
