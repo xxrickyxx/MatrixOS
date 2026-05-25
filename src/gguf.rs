@@ -208,15 +208,29 @@ impl<'a> Gguf<'a> {
     }
 }
 
-// ── GGML type ids we handle ───────────────────────────────────────────────────
+// ── GGML type ids (from ggml-common.h) ────────────────────────────────────────
+// All K-quant *variants* (Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M, Q6_K) share the SAME
+// ggml_type id — the S/M suffix only describes which tensors get bumped to a
+// higher precision, not a separate on-disk format.
 pub const GGML_TYPE_F32:   u32 = 0;
 pub const GGML_TYPE_F16:   u32 = 1;
 pub const GGML_TYPE_Q4_0:  u32 = 2;
+pub const GGML_TYPE_Q4_1:  u32 = 3;
+pub const GGML_TYPE_Q5_0:  u32 = 6;
+pub const GGML_TYPE_Q5_1:  u32 = 7;
 pub const GGML_TYPE_Q8_0:  u32 = 8;
-pub const GGML_TYPE_Q4_K:  u32 = 12; // alias used in some files; real Q4_K_S=16, Q4_K_M=17
-pub const GGML_TYPE_Q4_KS: u32 = 16;
-pub const GGML_TYPE_Q4_KM: u32 = 17;
-pub const GGML_TYPE_Q6_K:  u32 = 20;
+pub const GGML_TYPE_Q8_1:  u32 = 9;
+pub const GGML_TYPE_Q2_K:  u32 = 10;
+pub const GGML_TYPE_Q3_K:  u32 = 11;
+pub const GGML_TYPE_Q4_K:  u32 = 12;
+pub const GGML_TYPE_Q5_K:  u32 = 13;
+pub const GGML_TYPE_Q6_K:  u32 = 14;
+pub const GGML_TYPE_Q8_K:  u32 = 15;
+
+// Compatibility aliases for older code referencing Q4_KS / Q4_KM.
+// In GGUF these are NOT distinct type ids — both map to Q4_K (12).
+pub const GGML_TYPE_Q4_KS: u32 = GGML_TYPE_Q4_K;
+pub const GGML_TYPE_Q4_KM: u32 = GGML_TYPE_Q4_K;
 
 /// Byte size for `n_elems` elements of a GGML type.
 pub fn ggml_type_size(t: u32, n: usize) -> usize {
@@ -225,8 +239,6 @@ pub fn ggml_type_size(t: u32, n: usize) -> usize {
         GGML_TYPE_F16   => n * 2,
         GGML_TYPE_Q4_0  => { let nb = (n + 31) / 32;  nb * 18  }  // 2+16 bytes per block of 32
         GGML_TYPE_Q8_0  => { let nb = (n + 31) / 32;  nb * 34  }  // 2+32 bytes per block of 32
-        GGML_TYPE_Q4_KS |
-        GGML_TYPE_Q4_KM |
         GGML_TYPE_Q4_K  => { let nb = (n + 255) / 256; nb * 144 } // 144 bytes per block of 256
         GGML_TYPE_Q6_K  => { let nb = (n + 255) / 256; nb * 210 } // 210 bytes per block of 256
         _               => n * 4, // fallback F32

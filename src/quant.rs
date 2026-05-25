@@ -147,8 +147,7 @@ pub fn dequant_f16(data: &[u8], out: &mut [f32], n: usize) {
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 use crate::gguf::{GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0,
-                  GGML_TYPE_Q8_0, GGML_TYPE_Q4_KS, GGML_TYPE_Q4_KM,
-                  GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+                  GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
 
 pub fn dequant_row(data: &[u8], out: &mut [f32], n: usize, ggml_type: u32) {
     match ggml_type {
@@ -160,10 +159,10 @@ pub fn dequant_row(data: &[u8], out: &mut [f32], n: usize, ggml_type: u32) {
                 }
             }
         }
-        GGML_TYPE_F16                                  => dequant_f16(data, out, n),
-        GGML_TYPE_Q8_0                                 => dequant_q8_0(data, out, n),
-        GGML_TYPE_Q4_KS | GGML_TYPE_Q4_KM | GGML_TYPE_Q4_K => dequant_q4k(data, out, n),
-        GGML_TYPE_Q6_K                                 => dequant_q6k(data, out, n),
+        GGML_TYPE_F16  => dequant_f16(data, out, n),
+        GGML_TYPE_Q8_0 => dequant_q8_0(data, out, n),
+        GGML_TYPE_Q4_K => dequant_q4k(data, out, n),
+        GGML_TYPE_Q6_K => dequant_q6k(data, out, n),
         _ => { for x in &mut out[..n] { *x = 0.0; } }
     }
 }
@@ -204,10 +203,10 @@ fn block_elems(t: u32) -> usize {
 fn block_range(t: u32, _block_idx: usize, _n: usize) -> (usize, usize) {
     // returns (byte_size_of_one_block, bytes_to_advance)
     match t {
-        GGML_TYPE_F32 => (4, 4),
-        GGML_TYPE_F16 => (2, 2),
-        GGML_TYPE_Q8_0 => (34 * 1, 34),          // 1 block per call
-        GGML_TYPE_Q4_KS | GGML_TYPE_Q4_KM | GGML_TYPE_Q4_K => (144, 144),
+        GGML_TYPE_F32  => (4, 4),
+        GGML_TYPE_F16  => (2, 2),
+        GGML_TYPE_Q8_0 => (34, 34),
+        GGML_TYPE_Q4_K => (144, 144),
         GGML_TYPE_Q6_K => (210, 210),
         _ => (4, 4),
     }
