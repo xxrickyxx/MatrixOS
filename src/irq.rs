@@ -84,6 +84,44 @@ pub unsafe fn unmask_keyboard() {
     outb(PIC1_DATA, cur & !(1 << 1));
 }
 
+/// Unmask IRQ 0 on the master PIC (the PIT timer).
+pub unsafe fn unmask_timer() {
+    let cur = inb(PIC1_DATA);
+    outb(PIC1_DATA, cur & !(1 << 0));
+}
+
+// ── PIT (8254) at 0x40..0x43 ────────────────────────────────────────────────
+//
+// Channel 0 in mode 2 (rate generator), reloaded with `divisor` every tick;
+// the 1.193182 MHz input clock gives us tick_hz = 1_193_182 / divisor.
+//
+// We program ~100 Hz (divisor 11932) so ticks_ms increments by 10 each IRQ.
+// Coarse-but-cheap timing for /uptime and the status bar.
+
+const PIT_CMD:  u16 = 0x43;
+const PIT_CH0:  u16 = 0x40;
+const PIT_HZ:   u32 = 100;
+const PIT_DIV:  u16 = (1_193_182u32 / PIT_HZ) as u16;
+
+static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since `arm_pit()` was called.  Wrap-free for ~half a billion years.
+pub fn tick_ms() -> u64 {
+    TICKS.load(core::sync::atomic::Ordering::Relaxed) * (1000 / PIT_HZ as u64)
+}
+
+pub unsafe fn arm_pit() {
+    // Mode 2 (rate generator), access mode lobyte/hibyte, binary
+    outb(PIT_CMD, 0b00_11_010_0);
+    outb(PIT_CH0, (PIT_DIV & 0xFF) as u8);
+    outb(PIT_CH0, (PIT_DIV >> 8)  as u8);
+}
+
+pub extern "x86-interrupt" fn timer_isr(_frame: InterruptStackFrame) {
+    TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    unsafe { outb(PIC1_CMD, PIC_EOI); }
+}
+
 // ── Scancode ring buffer ────────────────────────────────────────────────────
 //
 // Single-producer (IRQ handler) / single-consumer (REPL polling) lock-free

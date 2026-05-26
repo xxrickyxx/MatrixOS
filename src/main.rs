@@ -24,6 +24,7 @@ pub mod net;
 pub mod bootstub;
 pub mod irq;
 pub mod ahci;
+pub mod fs;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -246,6 +247,7 @@ fn handle_slash_command(
             vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
             vga::term_puts("  /save              persist apps + settings to disk\n", vga::C_DIM);
             vga::term_puts("  /load              read saved state from disk\n", vga::C_DIM);
+            vga::term_puts("  /fs ls|save|cat|rm|format   tiny on-disk filesystem\n", vga::C_DIM);
             vga::term_puts("  /net               NIC MAC + link state\n", vga::C_DIM);
             vga::term_puts("  /net reset         soft-reset the NIC\n", vga::C_DIM);
             vga::term_puts("  /net arp <ip>      send a broadcast ARP request\n", vga::C_DIM);
@@ -938,6 +940,99 @@ fn handle_slash_command(
             }
             vga::term_puts("\n[http] poll timeout\n", vga::C_DIM);
         }
+        "/fs" => {
+            // /fs ls
+            // /fs format
+            // /fs save <name> <text...>
+            // /fs cat  <name>
+            // /fs rm   <name>
+            let (sub, sub_arg) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None    => (arg, ""),
+            };
+            match sub {
+                "" | "ls" => {
+                    match fs::list() {
+                        Ok(files) => {
+                            vga::term_puts("Files (", vga::C_CYAN);
+                            vga::term_putu32(files.len() as u32, vga::C_ORANGE);
+                            vga::term_puts(" / ", vga::C_DIM);
+                            vga::term_putu32(fs::MAX_FILES as u32, vga::C_DIM);
+                            vga::term_puts("):\n", vga::C_CYAN);
+                            for (name, size) in &files {
+                                vga::term_puts("  ", 0);
+                                vga::term_puts(name, vga::C_GREEN);
+                                vga::term_puts("   ", vga::C_DIM);
+                                vga::term_putu32(*size, vga::C_ORANGE);
+                                vga::term_puts(" bytes\n", vga::C_DIM);
+                            }
+                            if files.is_empty() {
+                                vga::term_puts("  (empty — try /fs format first)\n", vga::C_DIM);
+                            }
+                        }
+                        Err(e) => {
+                            vga::term_puts("[fs] ls error: ", vga::C_RED);
+                            vga::term_puts(e, vga::C_RED);
+                            vga::term_puts("\n", 0);
+                        }
+                    }
+                }
+                "format" => {
+                    match fs::format() {
+                        Ok(()) => vga::term_puts("[fs] formatted (empty directory)\n", vga::C_GREEN),
+                        Err(e) => { vga::term_puts("[fs] error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); vga::term_puts("\n", 0); }
+                    }
+                }
+                "save" => {
+                    let (name, text) = match sub_arg.find(char::is_whitespace) {
+                        Some(i) => (&sub_arg[..i], sub_arg[i..].trim_start()),
+                        None    => (sub_arg, ""),
+                    };
+                    if name.is_empty() {
+                        vga::term_puts("usage: /fs save <name> <text>\n", vga::C_RED); return;
+                    }
+                    match fs::save(name, text.as_bytes()) {
+                        Ok(()) => {
+                            vga::term_puts("[fs] saved ", vga::C_GREEN);
+                            vga::term_puts(name, vga::C_GREEN);
+                            vga::term_puts(" (", vga::C_DIM);
+                            vga::term_putu32(text.len() as u32, vga::C_ORANGE);
+                            vga::term_puts(" bytes)\n", vga::C_DIM);
+                        }
+                        Err(e) => { vga::term_puts("[fs] error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); vga::term_puts("\n", 0); }
+                    }
+                }
+                "cat" => {
+                    if sub_arg.is_empty() { vga::term_puts("usage: /fs cat <name>\n", vga::C_RED); return; }
+                    match fs::load(sub_arg) {
+                        Ok(data) => {
+                            vga::term_puts("--- ", vga::C_DIM);
+                            vga::term_puts(sub_arg, vga::C_GREEN);
+                            vga::term_puts(" (", vga::C_DIM);
+                            vga::term_putu32(data.len() as u32, vga::C_ORANGE);
+                            vga::term_puts(" bytes) ---\n", vga::C_DIM);
+                            for &b in &data {
+                                if (32..127).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                                    vga::term_putc(b, vga::C_TEXT);
+                                }
+                            }
+                            vga::term_puts("\n--- end ---\n", vga::C_DIM);
+                        }
+                        Err(e) => { vga::term_puts("[fs] error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); vga::term_puts("\n", 0); }
+                    }
+                }
+                "rm" => {
+                    if sub_arg.is_empty() { vga::term_puts("usage: /fs rm <name>\n", vga::C_RED); return; }
+                    match fs::delete(sub_arg) {
+                        Ok(()) => { vga::term_puts("[fs] removed ", vga::C_GREEN); vga::term_puts(sub_arg, vga::C_GREEN); vga::term_puts("\n", 0); }
+                        Err(e) => { vga::term_puts("[fs] error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); vga::term_puts("\n", 0); }
+                    }
+                }
+                _ => {
+                    vga::term_puts("unknown subcommand. try: /fs ls | save | cat | rm | format\n", vga::C_RED);
+                }
+            }
+        }
         "/resolve" => {
             if arg.is_empty() {
                 vga::term_puts("usage: /resolve <hostname>\n", vga::C_RED); return;
@@ -1180,19 +1275,23 @@ fn handle_slash_command(
             vga::term_puts("%)\n", vga::C_DIM);
         }
         "/uptime" => {
-            let elapsed_ticks = tsc.wrapping_sub(boot_tsc);
-            let hz   = math::tsc_hz();
-            let secs = elapsed_ticks / hz;
-            let ms   = (elapsed_ticks % hz) * 1000 / hz;
+            // Prefer the PIT-driven millisecond counter (cheap, monotonic).
+            // Fall back to TSC if the PIT hasn't ticked yet.
+            let ms_pit = irq::tick_ms();
+            let (secs, ms) = if ms_pit > 0 {
+                (ms_pit / 1000, ms_pit % 1000)
+            } else {
+                let elapsed_ticks = tsc.wrapping_sub(boot_tsc);
+                let hz = math::tsc_hz();
+                (elapsed_ticks / hz, (elapsed_ticks % hz) * 1000 / hz)
+            };
             vga::term_puts("Uptime: ", vga::C_DIM);
             vga::term_putu32(secs as u32, vga::C_GREEN);
             vga::term_puts(".", vga::C_DIM);
             if ms < 100 { vga::term_putc(b'0', vga::C_GREEN); }
             if ms <  10 { vga::term_putc(b'0', vga::C_GREEN); }
             vga::term_putu32(ms as u32, vga::C_GREEN);
-            vga::term_puts(" s  TSC=", vga::C_DIM);
-            vga::term_putu32((hz / 1_000_000) as u32, vga::C_ORANGE);
-            vga::term_puts(" MHz\n", vga::C_DIM);
+            vga::term_puts(" s  (PIT @100 Hz)\n", vga::C_DIM);
         }
         "/delete" => {
             if arg.is_empty() {
@@ -1999,10 +2098,12 @@ pub extern "C" fn _start() -> ! {
     // between polls (the "paste drops chars" issue).
     unsafe {
         irq::remap_pic();
+        irq::arm_pit();
+        irq::unmask_timer();
         irq::unmask_keyboard();
         irq::enable();
     }
-    vga::term_puts("[OK] IRQ keyboard armed (vector 0x21)\n", vga::C_GREEN);
+    vga::term_puts("[OK] IRQ keyboard + PIT timer armed\n", vga::C_GREEN);
 
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 4, 0xFF, 0x00, 0xFF); }
 

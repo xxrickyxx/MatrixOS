@@ -53,7 +53,9 @@ pub unsafe fn init() {
     setup_handler(13, gpf_handler            as *const () as u64);
     setup_handler(14, page_fault_handler     as *const () as u64);
 
-    // IRQ 1 (keyboard) — remapped to vector 0x21 by the PIC.
+    // IRQ 0 (PIT timer) — vector 0x20 after the PIC remap.
+    setup_handler(0x20, crate::irq::timer_isr as *const () as u64);
+    // IRQ 1 (keyboard) — vector 0x21.
     setup_handler(0x21, crate::irq::keyboard_isr as *const () as u64);
 
     asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
