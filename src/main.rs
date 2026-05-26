@@ -90,6 +90,11 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 /// translate physical addresses (e.g. NIC MMIO BARs) into kernel virtual.
 static mut HHDM_OFFSET: u64 = 0;
 
+/// Our IPv4 address — manually configurable via /net ip <a.b.c.d>.
+/// Default 10.0.2.15 because that's what VirtualBox NAT hands out by DHCP
+/// (we don't speak DHCP yet, so the user can /net ip-set if needed).
+static mut OUR_IP: [u8; 4] = [10, 0, 2, 15];
+
 // ── SSE enablement ────────────────────────────────────────────────────────────
 
 unsafe fn enable_sse() {
@@ -235,6 +240,8 @@ fn handle_slash_command(
             vga::term_puts("  /net               NIC MAC + link state\n", vga::C_DIM);
             vga::term_puts("  /net reset         soft-reset the NIC\n", vga::C_DIM);
             vga::term_puts("  /net arp <ip>      send a broadcast ARP request\n", vga::C_DIM);
+            vga::term_puts("  /net ip <a.b.c.d>  set our IPv4 address\n", vga::C_DIM);
+            vga::term_puts("  /ping <ip>         ARP + ICMP-echo a host\n", vga::C_DIM);
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
@@ -488,6 +495,20 @@ fn handle_slash_command(
                     vga::term_puts("  CTRL.RST issued\n", vga::C_CYAN);
                     unsafe { net::soft_reset(&nic); }
                 }
+                "ip" => {
+                    match parse_ipv4(sub_arg) {
+                        Some(ip) => {
+                            unsafe { OUR_IP = ip; }
+                            vga::term_puts("  OUR_IP = ", vga::C_GREEN);
+                            for (i, &b) in ip.iter().enumerate() {
+                                if i > 0 { vga::term_putc(b'.', vga::C_DIM); }
+                                vga::term_putu32(b as u32, vga::C_CYAN);
+                            }
+                            vga::term_puts("\n", 0);
+                        }
+                        None => { vga::term_puts("usage: /net ip <a.b.c.d>\n", vga::C_RED); }
+                    }
+                }
                 "arp" => {
                     // Parse "a.b.c.d"
                     let ip = match parse_ipv4(sub_arg) {
@@ -550,6 +571,109 @@ fn handle_slash_command(
                     vga::term_puts("unknown /net subcommand. try: /net | /net reset | /net arp <ip>\n", vga::C_RED);
                 }
             }
+        }
+        "/ping" => {
+            // Full ARP-then-ICMP-echo cycle.  Assumes the target is on the
+            // same subnet (no routing yet).
+            let hhdm = unsafe { HHDM_OFFSET };
+            let target_ip = match parse_ipv4(arg) {
+                Some(ip) => ip,
+                None => { vga::term_puts("usage: /ping <a.b.c.d>\n", vga::C_RED); return; }
+            };
+            let nic = match net::probe(hhdm) {
+                Some(n) => n,
+                None => { vga::term_puts("no NIC\n", vga::C_RED); return; }
+            };
+            let our_ip = unsafe { OUR_IP };
+
+            vga::term_puts("PING ", vga::C_CYAN);
+            for (i, &b) in target_ip.iter().enumerate() {
+                if i > 0 { vga::term_putc(b'.', vga::C_DIM); }
+                vga::term_putu32(b as u32, vga::C_ORANGE);
+            }
+            vga::term_puts("  from ", vga::C_DIM);
+            for (i, &b) in our_ip.iter().enumerate() {
+                if i > 0 { vga::term_putc(b'.', vga::C_DIM); }
+                vga::term_putu32(b as u32, vga::C_CYAN);
+            }
+            vga::term_puts("\n", 0);
+
+            let mut drv = net::Driver::init(nic, hhdm);
+            let mut cache = net::ArpCache::new();
+
+            // Step 1: ARP for the target
+            vga::term_puts("  arp who-has...\n", vga::C_DIM);
+            if drv.send_arp(our_ip, target_ip).is_err() {
+                vga::term_puts("  ARP TX failed\n", vga::C_RED); return;
+            }
+            let mut target_mac: Option<[u8; 6]> = None;
+            for _ in 0..400_000u32 {
+                if let Some((idx, _len)) = drv.poll_rx() {
+                    let frame = drv.rx_frame(idx);
+                    // Process ARP into cache + auto-reply if asked for us
+                    if let Some(reply) = net::process_arp(frame, &mut cache,
+                                                          drv.nic.mac, our_ip)
+                    {
+                        // Send the reply (best-effort, ignore errors)
+                        let _ = drv.send(&reply);
+                    }
+                    if let Some(mac) = cache.lookup(target_ip) {
+                        target_mac = Some(mac);
+                        break;
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            let dst_mac = match target_mac {
+                Some(m) => m,
+                None => {
+                    vga::term_puts("  no ARP reply (VBox NAT may not respond — use Bridged)\n", vga::C_RED);
+                    return;
+                }
+            };
+            vga::term_puts("  target MAC: ", vga::C_DIM);
+            for (i, &b) in dst_mac.iter().enumerate() {
+                if i > 0 { vga::term_putc(b':', vga::C_DIM); }
+                vga::term_puthex8(b, vga::C_CYAN);
+            }
+            vga::term_puts("\n", 0);
+
+            // Step 2: ICMP echo
+            let mut frame = [0u8; 64];
+            let payload = b"MatrixOS";
+            let n = match net::build_icmp_echo(
+                drv.nic.mac, our_ip, dst_mac, target_ip,
+                0xBEEF, 1, payload, &mut frame
+            ) {
+                Some(n) => n,
+                None => { vga::term_puts("  build_icmp_echo failed\n", vga::C_RED); return; }
+            };
+            vga::term_puts("  ICMP echo TX (", vga::C_CYAN);
+            vga::term_putu32(n as u32, vga::C_ORANGE);
+            vga::term_puts(" bytes)...\n", vga::C_CYAN);
+            if drv.send(&frame[..n]).is_err() {
+                vga::term_puts("  ICMP TX failed\n", vga::C_RED); return;
+            }
+
+            // Step 3: wait for echo-reply
+            for _ in 0..400_000u32 {
+                if let Some((idx, _len)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some((ident, seq, plen)) = net::parse_icmp_reply(f, our_ip) {
+                        vga::term_puts("  REPLY: ident=0x", vga::C_GREEN);
+                        vga::term_puthex8((ident >> 8) as u8, vga::C_ORANGE);
+                        vga::term_puthex8( ident       as u8, vga::C_ORANGE);
+                        vga::term_puts(" seq=", vga::C_DIM);
+                        vga::term_putu32(seq as u32, vga::C_ORANGE);
+                        vga::term_puts(" payload=", vga::C_DIM);
+                        vga::term_putu32(plen as u32, vga::C_ORANGE);
+                        vga::term_puts(" bytes  PING OK\n", vga::C_GREEN);
+                        return;
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            vga::term_puts("  no ICMP reply received\n", vga::C_RED);
         }
         "/meminfo" => {
             let used = allocator::heap_used();

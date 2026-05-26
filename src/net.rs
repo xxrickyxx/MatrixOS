@@ -372,3 +372,198 @@ impl Driver {
         &self.rx_bufs[off..off + len.min(RX_BUF_SIZE)]
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Protocol layer: ARP cache, IPv4 parse, ICMP echo
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const ET_IPV4: u16 = 0x0800;
+pub const ET_ARP:  u16 = 0x0806;
+
+pub const IP_PROTO_ICMP: u8 = 1;
+pub const IP_PROTO_UDP:  u8 = 17;
+
+/// Tiny ARP cache: 4 (ip, mac) entries, LRU-style replacement.
+pub struct ArpCache {
+    pub entries: [([u8; 4], [u8; 6], bool); 4],
+}
+
+impl ArpCache {
+    pub const fn new() -> Self {
+        Self { entries: [([0;4], [0;6], false); 4] }
+    }
+
+    pub fn lookup(&self, ip: [u8; 4]) -> Option<[u8; 6]> {
+        for e in &self.entries {
+            if e.2 && e.0 == ip { return Some(e.1); }
+        }
+        None
+    }
+
+    pub fn insert(&mut self, ip: [u8; 4], mac: [u8; 6]) {
+        // Update existing
+        for e in self.entries.iter_mut() {
+            if e.2 && e.0 == ip { e.1 = mac; return; }
+        }
+        // Find first empty
+        for e in self.entries.iter_mut() {
+            if !e.2 { *e = (ip, mac, true); return; }
+        }
+        // Otherwise overwrite slot 0 (oldest by convention)
+        self.entries[0] = (ip, mac, true);
+    }
+}
+
+/// Parsed Ethernet header view (no allocation).
+pub struct EthHdr<'a> {
+    pub dst:       &'a [u8],
+    pub src:       &'a [u8],
+    pub ethertype: u16,
+    pub payload:   &'a [u8],
+}
+
+pub fn parse_eth(frame: &[u8]) -> Option<EthHdr> {
+    if frame.len() < 14 { return None; }
+    Some(EthHdr {
+        dst:       &frame[0..6],
+        src:       &frame[6..12],
+        ethertype: u16::from_be_bytes([frame[12], frame[13]]),
+        payload:   &frame[14..],
+    })
+}
+
+/// Look at an incoming Ethernet frame.  If it's an ARP reply, learn the
+/// (sender_ip, sender_mac) into the cache.  If it's an ARP request for
+/// `our_ip`, build a reply frame and return Some(reply_buf).  Returns
+/// None when no automatic reply is needed.
+pub fn process_arp(frame: &[u8], cache: &mut ArpCache,
+                   our_mac: [u8; 6], our_ip: [u8; 4]) -> Option<[u8; 42]>
+{
+    let eth = parse_eth(frame)?;
+    if eth.ethertype != ET_ARP { return None; }
+    if eth.payload.len() < 28 { return None; }
+    let p = eth.payload;
+
+    // Validate htype=1 (Ethernet), ptype=0x0800 (IPv4)
+    if u16::from_be_bytes([p[0], p[1]]) != 1     { return None; }
+    if u16::from_be_bytes([p[2], p[3]]) != ET_IPV4 { return None; }
+    let op = u16::from_be_bytes([p[6], p[7]]);
+
+    let sender_mac: [u8; 6] = p[8..14].try_into().ok()?;
+    let sender_ip:  [u8; 4] = p[14..18].try_into().ok()?;
+    let target_ip:  [u8; 4] = p[24..28].try_into().ok()?;
+
+    // Learn from any ARP we see (reply *or* request — we know that node's MAC).
+    cache.insert(sender_ip, sender_mac);
+
+    // If this is a request asking for our IP, build a reply.
+    if op == 1 && target_ip == our_ip {
+        let mut reply = [0u8; 42];
+        reply[0..6].copy_from_slice(&sender_mac);             // dst = requester
+        reply[6..12].copy_from_slice(&our_mac);               // src = us
+        reply[12..14].copy_from_slice(&ET_ARP.to_be_bytes()); // type
+        // ARP payload
+        reply[14..16].copy_from_slice(&1u16.to_be_bytes());   // htype
+        reply[16..18].copy_from_slice(&ET_IPV4.to_be_bytes()); // ptype
+        reply[18] = 6;
+        reply[19] = 4;
+        reply[20..22].copy_from_slice(&2u16.to_be_bytes());   // op = reply
+        reply[22..28].copy_from_slice(&our_mac);
+        reply[28..32].copy_from_slice(&our_ip);
+        reply[32..38].copy_from_slice(&sender_mac);
+        reply[38..42].copy_from_slice(&sender_ip);
+        return Some(reply);
+    }
+    None
+}
+
+/// Compute the standard 16-bit one's-complement checksum (IP / ICMP / UDP
+/// headers).  Caller zeroes the checksum field first.
+pub fn ip_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build an ICMP-Echo request frame inside `out` and return the length.
+/// `dst_mac` should come from ArpCache::lookup of the gateway (or directly
+/// the host if same subnet).
+pub fn build_icmp_echo(
+    our_mac: [u8; 6], our_ip: [u8; 4],
+    dst_mac: [u8; 6], dst_ip: [u8; 4],
+    ident: u16, seq: u16, payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let icmp_len = 8 + payload.len();
+    let ip_len   = 20 + icmp_len;
+    let total    = 14 + ip_len;
+    if out.len() < total { return None; }
+
+    // Eth header
+    out[0..6].copy_from_slice(&dst_mac);
+    out[6..12].copy_from_slice(&our_mac);
+    out[12..14].copy_from_slice(&ET_IPV4.to_be_bytes());
+
+    // IPv4 header
+    out[14] = (4 << 4) | 5;                              // ver=4, IHL=5 (no opts)
+    out[15] = 0;                                         // DSCP/ECN
+    out[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    out[18..20].copy_from_slice(&0u16.to_be_bytes());    // ident
+    out[20..22].copy_from_slice(&0u16.to_be_bytes());    // flags/frag-off
+    out[22] = 64;                                        // TTL
+    out[23] = IP_PROTO_ICMP;
+    out[24..26].copy_from_slice(&0u16.to_be_bytes());    // checksum (later)
+    out[26..30].copy_from_slice(&our_ip);
+    out[30..34].copy_from_slice(&dst_ip);
+    let ip_csum = ip_checksum(&out[14..14 + 20]);
+    out[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // ICMP echo (type 8, code 0)
+    let icmp_off = 14 + 20;
+    out[icmp_off]     = 8;
+    out[icmp_off + 1] = 0;
+    out[icmp_off + 2] = 0;   // csum
+    out[icmp_off + 3] = 0;
+    out[icmp_off + 4..icmp_off + 6].copy_from_slice(&ident.to_be_bytes());
+    out[icmp_off + 6..icmp_off + 8].copy_from_slice(&seq.to_be_bytes());
+    out[icmp_off + 8..icmp_off + 8 + payload.len()].copy_from_slice(payload);
+    let icmp_csum = ip_checksum(&out[icmp_off..icmp_off + icmp_len]);
+    out[icmp_off + 2..icmp_off + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    Some(total)
+}
+
+/// Inspect an Ethernet frame: if it's an ICMP echo REPLY (type 0) to our
+/// IP, return Some((ident, seq, payload_len)) — caller can then declare
+/// the ping a success.
+pub fn parse_icmp_reply(frame: &[u8], our_ip: [u8; 4]) -> Option<(u16, u16, usize)> {
+    let eth = parse_eth(frame)?;
+    if eth.ethertype != ET_IPV4 { return None; }
+    let ip = eth.payload;
+    if ip.len() < 20 { return None; }
+    let ver_ihl = ip[0];
+    if ver_ihl >> 4 != 4 { return None; }
+    let ihl = ((ver_ihl & 0xF) as usize) * 4;
+    if ip.len() < ihl + 8 { return None; }
+    let proto = ip[9];
+    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
+    if proto != IP_PROTO_ICMP || dst_ip != our_ip { return None; }
+
+    let icmp = &ip[ihl..];
+    if icmp[0] != 0 { return None; }   // type 0 = Echo Reply
+    let ident = u16::from_be_bytes([icmp[4], icmp[5]]);
+    let seq   = u16::from_be_bytes([icmp[6], icmp[7]]);
+    let payload_len = icmp.len() - 8;
+    Some((ident, seq, payload_len))
+}
+
