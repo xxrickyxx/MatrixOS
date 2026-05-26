@@ -229,7 +229,9 @@ fn handle_slash_command(
             vga::term_puts("  /set auto=on|off   intent auto-switching\n", vga::C_DIM);
             vga::term_puts("  /save              persist apps + settings to disk\n", vga::C_DIM);
             vga::term_puts("  /load              read saved state from disk\n", vga::C_DIM);
-            vga::term_puts("  /net [reset]       NIC info / link state / soft-reset\n", vga::C_DIM);
+            vga::term_puts("  /net               NIC MAC + link state\n", vga::C_DIM);
+            vga::term_puts("  /net reset         soft-reset the NIC\n", vga::C_DIM);
+            vga::term_puts("  /net arp <ip>      send a broadcast ARP request\n", vga::C_DIM);
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
@@ -438,56 +440,111 @@ fn handle_slash_command(
             }
         }
         "/net" => {
+            // Parsing the sub-action.  Supported:
+            //   /net              report MAC, link, basic info
+            //   /net reset        CTRL.RST + redo basic init
+            //   /net arp <ip>     bring up TX/RX rings, send 1 broadcast ARP
+            //   /net stats        re-show last driver TX/RX counters
             let hhdm = unsafe { HHDM_OFFSET };
-            let do_reset = arg == "reset";
-            match net::probe(hhdm) {
-                Some(mut nic) => {
-                    vga::term_puts("NIC: ", vga::C_CYAN);
-                    vga::term_puts(nic.addr.nic_model(), vga::C_GREEN);
-                    vga::term_puts("\n  MAC:   ", vga::C_DIM);
-                    for (i, &b) in nic.mac.iter().enumerate() {
-                        if i > 0 { vga::term_putc(b':', vga::C_DIM); }
-                        vga::term_puthex8(b, vga::C_CYAN);
-                    }
-                    vga::term_puts("\n  BAR0:  0x", vga::C_DIM);
-                    // print high+low 32-bit halves
-                    vga::term_puthex8((nic.mmio_phys >> 56) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >> 48) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >> 40) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >> 32) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >> 24) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >> 16) as u8, vga::C_ORANGE);
-                    vga::term_puthex8((nic.mmio_phys >>  8) as u8, vga::C_ORANGE);
-                    vga::term_puthex8( nic.mmio_phys        as u8, vga::C_ORANGE);
-                    vga::term_puts("\n  link:  ", vga::C_DIM);
-                    if nic.link_up {
-                        vga::term_puts("UP", vga::C_GREEN);
-                        vga::term_puts("  ", 0);
-                        vga::term_putu32(nic.speed_mbps, vga::C_ORANGE);
-                        vga::term_puts(" Mbps", vga::C_DIM);
-                        vga::term_puts(if nic.full_duplex {" full-dup\n"} else {" half-dup\n"}, vga::C_DIM);
-                    } else {
-                        vga::term_puts("DOWN", vga::C_RED);
-                        vga::term_puts(" (cable / VM NAT may not provide link state)\n", vga::C_DIM);
-                    }
-                    if do_reset {
-                        vga::term_puts("  resetting controller...\n", vga::C_CYAN);
-                        unsafe { net::soft_reset(&nic); }
-                        // Re-probe to see post-reset state.
-                        if let Some(after) = net::probe(hhdm) {
-                            nic = after;
-                            vga::term_puts("  post-reset link: ", vga::C_DIM);
-                            vga::term_puts(if nic.link_up {"UP\n"} else {"DOWN\n"},
-                                           if nic.link_up {vga::C_GREEN} else {vga::C_RED});
-                        }
-                    } else {
-                        vga::term_puts("  hint: /net reset  to issue CTRL.RST\n", vga::C_DIM);
-                    }
-                    vga::term_puts("  (TX/RX rings + packet send: future PR)\n", vga::C_DIM);
-                }
+            let (sub, sub_arg) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None    => (arg, ""),
+            };
+
+            let mut nic = match net::probe(hhdm) {
+                Some(n) => n,
                 None => {
                     vga::term_puts("No e1000-class NIC found, or HHDM unavailable.\n", vga::C_RED);
-                    vga::term_puts("Run /sysinfo to see what NIC the PCI scan reported.\n", vga::C_DIM);
+                    return;
+                }
+            };
+
+            // Always print the basic header.
+            vga::term_puts("NIC: ", vga::C_CYAN);
+            vga::term_puts(nic.addr.nic_model(), vga::C_GREEN);
+            vga::term_puts("\n  MAC:  ", vga::C_DIM);
+            for (i, &b) in nic.mac.iter().enumerate() {
+                if i > 0 { vga::term_putc(b':', vga::C_DIM); }
+                vga::term_puthex8(b, vga::C_CYAN);
+            }
+            vga::term_puts("\n  link: ", vga::C_DIM);
+            if nic.link_up {
+                vga::term_puts("UP  ", vga::C_GREEN);
+                vga::term_putu32(nic.speed_mbps, vga::C_ORANGE);
+                vga::term_puts(" Mbps", vga::C_DIM);
+                vga::term_puts(if nic.full_duplex {" full-dup\n"} else {" half-dup\n"}, vga::C_DIM);
+            } else {
+                vga::term_puts("DOWN\n", vga::C_RED);
+            }
+
+            match sub {
+                "" => {
+                    vga::term_puts("  hint: /net reset | /net arp <ip>\n", vga::C_DIM);
+                }
+                "reset" => {
+                    vga::term_puts("  CTRL.RST issued\n", vga::C_CYAN);
+                    unsafe { net::soft_reset(&nic); }
+                }
+                "arp" => {
+                    // Parse "a.b.c.d"
+                    let ip = match parse_ipv4(sub_arg) {
+                        Some(ip) => ip,
+                        None => {
+                            vga::term_puts("usage: /net arp <a.b.c.d>\n", vga::C_RED);
+                            return;
+                        }
+                    };
+                    vga::term_puts("  bringing up driver (TX+RX rings)...\n", vga::C_CYAN);
+                    let mut drv = net::Driver::init(nic, hhdm);
+                    vga::term_puts("  sending ARP-who-has ", vga::C_CYAN);
+                    for (i, &b) in ip.iter().enumerate() {
+                        if i > 0 { vga::term_putc(b'.', vga::C_DIM); }
+                        vga::term_putu32(b as u32, vga::C_ORANGE);
+                    }
+                    vga::term_puts(" ...\n", vga::C_CYAN);
+                    let sender_ip = [0u8, 0, 0, 0];   // we have no IP yet
+                    match drv.send_arp(sender_ip, ip) {
+                        Ok(()) => {
+                            vga::term_puts("  TX OK (1 frame sent)\n", vga::C_GREEN);
+                            // Poll a few iterations for any RX frame.
+                            vga::term_puts("  polling RX for 100 ms-ish...\n", vga::C_DIM);
+                            let mut rx_seen = 0u32;
+                            for _ in 0..200_000u32 {
+                                if let Some((idx, len)) = drv.poll_rx() {
+                                    rx_seen += 1;
+                                    vga::term_puts("  RX[", vga::C_GREEN);
+                                    vga::term_putu32(idx as u32, vga::C_ORANGE);
+                                    vga::term_puts("] ", vga::C_DIM);
+                                    vga::term_putu32(len as u32, vga::C_GREEN);
+                                    vga::term_puts(" bytes  type=0x", vga::C_DIM);
+                                    let frame = drv.rx_frame(idx);
+                                    if frame.len() >= 14 {
+                                        vga::term_puthex8(frame[12], vga::C_ORANGE);
+                                        vga::term_puthex8(frame[13], vga::C_ORANGE);
+                                    }
+                                    vga::term_puts("\n", 0);
+                                    if rx_seen >= 4 { break; }
+                                }
+                                unsafe { core::arch::asm!("pause"); }
+                            }
+                            if rx_seen == 0 {
+                                vga::term_puts("  no frames received (VM NAT may not respond to ARP)\n", vga::C_DIM);
+                            }
+                            vga::term_puts("  stats: TX=", vga::C_DIM);
+                            vga::term_putu32(drv.tx_sent, vga::C_GREEN);
+                            vga::term_puts(" RX=", vga::C_DIM);
+                            vga::term_putu32(drv.rx_recv, vga::C_GREEN);
+                            vga::term_puts("\n", 0);
+                        }
+                        Err(e) => {
+                            vga::term_puts("  TX error: ", vga::C_RED);
+                            vga::term_puts(e, vga::C_RED);
+                            vga::term_puts("\n", 0);
+                        }
+                    }
+                }
+                _ => {
+                    vga::term_puts("unknown /net subcommand. try: /net | /net reset | /net arp <ip>\n", vga::C_RED);
                 }
             }
         }
@@ -1065,6 +1122,35 @@ fn try_create_app_via_ai(
 
     vga::term_puts("[give-up] could not produce a valid recipe in 4 rounds.\n", vga::C_RED);
     vga::term_puts("Try a simpler description, or write the recipe yourself.\n", vga::C_DIM);
+}
+
+/// Parse a dotted-quad IPv4 like "192.168.1.1" into [u8; 4].
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let s = s.trim();
+    let mut out = [0u8; 4];
+    let mut idx = 0usize;
+    let mut cur: u32 = 0;
+    let mut seen_digit = false;
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                cur = cur.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+                if cur > 255 { return None; }
+                seen_digit = true;
+            }
+            b'.' => {
+                if !seen_digit || idx >= 3 { return None; }
+                out[idx] = cur as u8;
+                idx += 1;
+                cur = 0;
+                seen_digit = false;
+            }
+            _ => return None,
+        }
+    }
+    if !seen_digit || idx != 3 { return None; }
+    out[3] = cur as u8;
+    Some(out)
 }
 
 fn parse_u32_safe(s: &str) -> Option<u32> {
