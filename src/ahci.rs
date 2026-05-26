@@ -344,3 +344,145 @@ unsafe fn identify_port(abar: u64, port_idx: usize, hhdm: u64) -> Option<AhciDri
 fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
+
+// ── Read/write public API ───────────────────────────────────────────────────
+//
+// Each call is one-shot (re-allocates the port DMA structures); fine for the
+// /install usage pattern (a few thousand chunks of 64 sectors).  A future
+// optimisation can cache the per-port AhciPort state across calls.
+
+const ATA_CMD_READ_DMA_EXT:  u8 = 0x25;
+const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+
+/// Read `count` sectors from `port_idx`, LBA `lba`, into `buf`.
+/// `count` must be <= 32 (sized to fit a single 64 KB PRDT comfortably).
+pub fn read_sectors(hhdm: u64, port_idx: u8, lba: u64, count: u16, buf: &mut [u8]) -> Result<(), &'static str> {
+    if count == 0 || count > 32 { return Err("bad sector count"); }
+    if buf.len() < (count as usize) * 512 { return Err("buf too small"); }
+    let abar = find_abar(hhdm).ok_or("no AHCI controller")?;
+    unsafe { run_transfer(abar, port_idx as usize, ATA_CMD_READ_DMA_EXT, lba, count, hhdm,
+                          buf.as_mut_ptr(), buf.len(), /*write=*/false) }
+}
+
+/// Write `count` sectors to `port_idx`, LBA `lba`, from `buf`.
+pub fn write_sectors(hhdm: u64, port_idx: u8, lba: u64, count: u16, buf: &[u8]) -> Result<(), &'static str> {
+    if count == 0 || count > 32 { return Err("bad sector count"); }
+    if buf.len() < (count as usize) * 512 { return Err("buf too small"); }
+    let abar = find_abar(hhdm).ok_or("no AHCI controller")?;
+    unsafe { run_transfer(abar, port_idx as usize, ATA_CMD_WRITE_DMA_EXT, lba, count, hhdm,
+                          buf.as_ptr() as *mut u8, buf.len(), /*write=*/true) }
+}
+
+fn find_abar(hhdm: u64) -> Option<u64> {
+    let mut found: Option<pci::PciDevice> = None;
+    pci::enumerate(|d| {
+        if d.class_code == 0x01 && d.subclass == 0x06 && found.is_none() {
+            found = Some(d);
+        }
+    });
+    let dev = found?;
+    let raw = pci::pci_read32(dev.bus, dev.dev, dev.func, 0x24);
+    if raw & 1 != 0 { return None; }
+    let phys = (raw & 0xFFFF_FFF0) as u64;
+    if phys == 0 { return None; }
+    Some(phys.wrapping_add(hhdm))
+}
+
+unsafe fn run_transfer(
+    abar: u64, port_idx: usize, ata_cmd: u8, lba: u64, count: u16,
+    hhdm: u64, data_buf: *mut u8, data_len: usize, write: bool,
+) -> Result<(), &'static str> {
+    let p = abar + port_base(port_idx);
+
+    // Quiesce port.
+    let cmd = r32(p + PORT_CMD);
+    w32(p + PORT_CMD, cmd & !PORT_CMD_ST);
+    let mut spins = 0u32;
+    while r32(p + PORT_CMD) & PORT_CMD_CR != 0 {
+        spins += 1; if spins > 100_000 { return Err("port stop timeout"); }
+        core::arch::asm!("pause");
+    }
+    let cmd = r32(p + PORT_CMD);
+    w32(p + PORT_CMD, cmd & !PORT_CMD_FRE);
+    spins = 0;
+    while r32(p + PORT_CMD) & PORT_CMD_FR != 0 {
+        spins += 1; if spins > 100_000 { return Err("FR clear timeout"); }
+        core::arch::asm!("pause");
+    }
+
+    // DMA buffers (transient — kept alive on the stack/vec until command done)
+    let cl: Vec<u8> = alloc::vec![0u8; CMD_LIST_SIZE + 1024];
+    let cl_virt = align_up(cl.as_ptr() as u64, 1024);
+    let cl_phys = cl_virt.wrapping_sub(hhdm);
+
+    let fis: Vec<u8> = alloc::vec![0u8; FIS_BUF_SIZE + 256];
+    let fis_virt = align_up(fis.as_ptr() as u64, 256);
+    let fis_phys = fis_virt.wrapping_sub(hhdm);
+
+    let ct: Vec<u8> = alloc::vec![0u8; CMD_TABLE_SIZE + 128];
+    let ct_virt = align_up(ct.as_ptr() as u64, 128);
+    let ct_phys = ct_virt.wrapping_sub(hhdm);
+
+    let data_phys = (data_buf as u64).wrapping_sub(hhdm);
+
+    w32(p + PORT_CLB,  (cl_phys & 0xFFFF_FFFF) as u32);
+    w32(p + PORT_CLBU, (cl_phys >> 32)        as u32);
+    w32(p + PORT_FB,   (fis_phys & 0xFFFF_FFFF)    as u32);
+    w32(p + PORT_FBU,  (fis_phys >> 32)            as u32);
+    w32(p + PORT_IS,   0xFFFF_FFFF);
+    w32(p + PORT_SERR, 0xFFFF_FFFF);
+
+    let cmd = r32(p + PORT_CMD);
+    w32(p + PORT_CMD, cmd | PORT_CMD_FRE);
+    spins = 0;
+    while r32(p + PORT_TFD) & (ATA_DEV_BUSY | ATA_DEV_DRQ) != 0 {
+        spins += 1; if spins > 1_000_000 { return Err("device busy"); }
+        core::arch::asm!("pause");
+    }
+    let cmd = r32(p + PORT_CMD);
+    w32(p + PORT_CMD, cmd | PORT_CMD_ST);
+
+    // Command header slot 0
+    let ch = cl_virt as *mut CmdHeader;
+    let mut dw0 = 5u32 | (1 << 16); // cfl=5, prdtl=1
+    if write { dw0 |= 1 << 6; }
+    (*ch).dw0   = dw0;
+    (*ch).prdbc = 0;
+    (*ch).ctba  = (ct_phys & 0xFFFF_FFFF) as u32;
+    (*ch).ctbau = (ct_phys >> 32) as u32;
+
+    // FIS
+    let f = ct_virt as *mut FisH2D;
+    core::ptr::write_bytes(f as *mut u8, 0, core::mem::size_of::<FisH2D>());
+    (*f).fis_type = 0x27;
+    (*f).flags    = 0x80;
+    (*f).command  = ata_cmd;
+    (*f).device   = 1 << 6;                       // LBA mode
+    (*f).lba0     = (lba       & 0xFF) as u8;
+    (*f).lba1     = ((lba >>  8) & 0xFF) as u8;
+    (*f).lba2     = ((lba >> 16) & 0xFF) as u8;
+    (*f).lba3     = ((lba >> 24) & 0xFF) as u8;
+    (*f).lba4     = ((lba >> 32) & 0xFF) as u8;
+    (*f).lba5     = ((lba >> 40) & 0xFF) as u8;
+    (*f).count_lo = (count       & 0xFF) as u8;
+    (*f).count_hi = ((count >> 8) & 0xFF) as u8;
+
+    // PRDT slot 0
+    let prdt = (ct_virt + 0x80) as *mut Prdt;
+    (*prdt).dba  = (data_phys & 0xFFFF_FFFF) as u32;
+    (*prdt).dbau = (data_phys >> 32) as u32;
+    (*prdt).dbc  = (data_len as u32 - 1) | (1 << 31);
+
+    // Issue.
+    w32(p + PORT_CI, 1);
+    spins = 0;
+    while r32(p + PORT_CI) & 1 != 0 {
+        if r32(p + PORT_IS) & (1 << 30) != 0 { return Err("AHCI task file error"); }
+        spins += 1; if spins > 5_000_000 { return Err("AHCI command timeout"); }
+        core::arch::asm!("pause");
+    }
+    if r32(p + PORT_IS) & (1 << 30) != 0 { return Err("AHCI task file error"); }
+
+    drop(cl); drop(fis); drop(ct);
+    Ok(())
+}

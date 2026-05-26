@@ -243,6 +243,8 @@ fn handle_slash_command(
             vga::term_puts("  /net arp <ip>      send a broadcast ARP request\n", vga::C_DIM);
             vga::term_puts("  /net ip <a.b.c.d>  set our IPv4 address\n", vga::C_DIM);
             vga::term_puts("  /ping <ip>         ARP + ICMP-echo a host\n", vga::C_DIM);
+            vga::term_puts("  /dhcp              DHCP DISCOVER+REQUEST, auto-config IP\n", vga::C_DIM);
+            vga::term_puts("  /tcp <ip> <port> <text>   TCP handshake + send + read\n", vga::C_DIM);
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
@@ -600,6 +602,258 @@ fn handle_slash_command(
                     vga::term_puts("unknown /net subcommand. try: /net | /net reset | /net arp <ip>\n", vga::C_RED);
                 }
             }
+        }
+        "/tcp" => {
+            // Format: /tcp <ip> <port> <text>
+            let (ip_str, rest) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None => { vga::term_puts("usage: /tcp <ip> <port> <text>\n", vga::C_RED); return; }
+            };
+            let (port_str, text) = match rest.find(char::is_whitespace) {
+                Some(i) => (&rest[..i], rest[i..].trim_start()),
+                None => (rest, ""),
+            };
+            let dst_ip = match parse_ipv4(ip_str) {
+                Some(ip) => ip,
+                None => { vga::term_puts("bad IP\n", vga::C_RED); return; }
+            };
+            let dst_port = match parse_u32_safe(port_str) {
+                Some(n) if n < 65536 => n as u16,
+                _ => { vga::term_puts("bad port\n", vga::C_RED); return; }
+            };
+
+            let hhdm = unsafe { HHDM_OFFSET };
+            let nic = match net::probe(hhdm) {
+                Some(n) => n,
+                None => { vga::term_puts("no NIC\n", vga::C_RED); return; }
+            };
+            let mut drv = net::Driver::init(nic, hhdm);
+            let mut cache = net::ArpCache::new();
+            let our_ip = unsafe { OUR_IP };
+
+            // ARP for target (or gateway if not same subnet — we assume same subnet)
+            vga::term_puts("[tcp] arp ", vga::C_DIM); print_ipv4(dst_ip); vga::term_puts("...\n", vga::C_DIM);
+            if drv.send_arp(our_ip, dst_ip).is_err() {
+                vga::term_puts("[tcp] ARP TX failed\n", vga::C_RED); return;
+            }
+            let mut dst_mac: Option<[u8; 6]> = None;
+            for _ in 0..400_000u32 {
+                if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(reply) = net::process_arp(f, &mut cache, drv.nic.mac, our_ip) {
+                        let _ = drv.send(&reply);
+                    }
+                    if let Some(m) = cache.lookup(dst_ip) { dst_mac = Some(m); break; }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            let dst_mac = match dst_mac {
+                Some(m) => m,
+                None => { vga::term_puts("[tcp] no ARP reply\n", vga::C_RED); return; }
+            };
+
+            // ── SYN ──────────────────────────────────────────────────────
+            let src_port: u16 = 49152 + ((math::rdtsc() as u16) & 0x0FFF);
+            let our_isn: u32 = math::rdtsc() as u32;
+            let mut frame = [0u8; 1500];
+            let n = net::build_tcp(
+                drv.nic.mac, our_ip, src_port, dst_mac, dst_ip, dst_port,
+                our_isn, 0, net::TCP_SYN, 8192, &[], &mut frame
+            ).unwrap_or(0);
+            vga::term_puts("[tcp] SYN -> ", vga::C_CYAN);
+            print_ipv4(dst_ip); vga::term_puts(":", vga::C_DIM); vga::term_putu32(dst_port as u32, vga::C_ORANGE);
+            vga::term_puts("\n", 0);
+            if drv.send(&frame[..n]).is_err() {
+                vga::term_puts("[tcp] SYN TX failed\n", vga::C_RED); return;
+            }
+
+            // ── Wait for SYN-ACK ─────────────────────────────────────────
+            let mut peer_seq: u32 = 0;
+            let mut got_synack = false;
+            for _ in 0..2_000_000u32 {
+                if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(seg) = net::parse_tcp(f) {
+                        if seg.dst_port == src_port
+                           && seg.flags & net::TCP_SYN != 0
+                           && seg.flags & net::TCP_ACK != 0
+                        {
+                            peer_seq = seg.seq;
+                            got_synack = true;
+                            break;
+                        }
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            if !got_synack { vga::term_puts("[tcp] no SYN-ACK\n", vga::C_RED); return; }
+            vga::term_puts("[tcp] SYN-ACK received, peer_isn=", vga::C_GREEN);
+            vga::term_putu32(peer_seq, vga::C_ORANGE);
+            vga::term_puts("\n", 0);
+
+            // ── ACK (3rd of handshake) ───────────────────────────────────
+            let our_seq = our_isn.wrapping_add(1);
+            let our_ack = peer_seq.wrapping_add(1);
+            let n = net::build_tcp(
+                drv.nic.mac, our_ip, src_port, dst_mac, dst_ip, dst_port,
+                our_seq, our_ack, net::TCP_ACK, 8192, &[], &mut frame
+            ).unwrap_or(0);
+            let _ = drv.send(&frame[..n]);
+
+            // ── Send the payload (PSH + ACK) ────────────────────────────
+            let mut payload_seq = our_seq;
+            if !text.is_empty() {
+                let n = net::build_tcp(
+                    drv.nic.mac, our_ip, src_port, dst_mac, dst_ip, dst_port,
+                    payload_seq, our_ack, net::TCP_PSH | net::TCP_ACK, 8192,
+                    text.as_bytes(), &mut frame
+                ).unwrap_or(0);
+                vga::term_puts("[tcp] TX ", vga::C_CYAN);
+                vga::term_putu32(text.len() as u32, vga::C_ORANGE);
+                vga::term_puts(" bytes\n", vga::C_CYAN);
+                if drv.send(&frame[..n]).is_err() {
+                    vga::term_puts("[tcp] payload TX failed\n", vga::C_RED);
+                }
+                payload_seq = payload_seq.wrapping_add(text.len() as u32);
+            }
+
+            // ── Read whatever comes back ────────────────────────────────
+            vga::term_puts("[tcp] RX:\n", vga::C_CYAN);
+            for _ in 0..2_000_000u32 {
+                // Pull one frame and copy out everything we need so we can
+                // free the immutable borrow before calling drv.send below.
+                let action: Option<(u32, u8, alloc::vec::Vec<u8>)> = if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(seg) = net::parse_tcp(f) {
+                        if seg.dst_port == src_port {
+                            let payload: alloc::vec::Vec<u8> = seg.payload.to_vec();
+                            // Compute next-ack we'd send.
+                            let len_consumed = payload.len() as u32
+                                             + if seg.flags & net::TCP_FIN != 0 { 1 } else { 0 };
+                            Some((seg.seq.wrapping_add(len_consumed), seg.flags, payload))
+                        } else { None }
+                    } else { None }
+                } else { None };
+
+                if let Some((peer_ack, flags, payload)) = action {
+                    // Print printable payload bytes
+                    for &b in &payload {
+                        if (32..127).contains(&b) || b == b'\n' || b == b'\r' {
+                            vga::term_putc(b, vga::C_TEXT);
+                        }
+                    }
+                    // Always ACK
+                    let tcp_flags = if flags & net::TCP_FIN != 0 {
+                        net::TCP_FIN | net::TCP_ACK
+                    } else {
+                        net::TCP_ACK
+                    };
+                    let n = net::build_tcp(
+                        drv.nic.mac, our_ip, src_port, dst_mac, dst_ip, dst_port,
+                        payload_seq, peer_ack, tcp_flags, 8192, &[], &mut frame
+                    ).unwrap_or(0);
+                    let _ = drv.send(&frame[..n]);
+                    if flags & net::TCP_FIN != 0 {
+                        vga::term_puts("\n[tcp] FIN, connection closed\n", vga::C_DIM);
+                        return;
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            vga::term_puts("\n[tcp] poll timeout (connection still open)\n", vga::C_DIM);
+        }
+        "/dhcp" => {
+            // Full 4-way DHCP exchange to auto-configure our IP, gateway,
+            // netmask, DNS.  Broadcast media so no ARP needed up front.
+            let hhdm = unsafe { HHDM_OFFSET };
+            let nic = match net::probe(hhdm) {
+                Some(n) => n,
+                None => { vga::term_puts("no NIC\n", vga::C_RED); return; }
+            };
+            let mut drv = net::Driver::init(nic, hhdm);
+            let xid: u32 = (math::rdtsc() as u32) ^ 0xDEAD_BEEF;
+            let bcast_mac = [0xFFu8; 6];
+            let bcast_ip  = [0xFFu8; 4];
+
+            // ── 1. DHCPDISCOVER ──────────────────────────────────────────
+            vga::term_puts("[dhcp] DISCOVER...\n", vga::C_CYAN);
+            let mut dhcp = [0u8; 300];
+            net::build_dhcp(drv.nic.mac, xid, 1, None, None, &mut dhcp);
+            let mut frame = [0u8; 400];
+            let n = match net::build_udp(
+                drv.nic.mac, [0,0,0,0], net::DHCP_CLIENT_PORT,
+                bcast_mac, bcast_ip, net::DHCP_SERVER_PORT,
+                &dhcp, &mut frame,
+            ) { Some(n) => n, None => { vga::term_puts("build_udp failed\n", vga::C_RED); return; }};
+            if drv.send(&frame[..n]).is_err() {
+                vga::term_puts("[dhcp] DISCOVER TX failed\n", vga::C_RED); return;
+            }
+
+            // ── 2. Wait for DHCPOFFER ────────────────────────────────────
+            let mut offer: Option<net::DhcpLease> = None;
+            for _ in 0..2_000_000u32 {
+                if let Some((idx, _len)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(pkt) = net::parse_udp(f) {
+                        if pkt.dst_port == net::DHCP_CLIENT_PORT {
+                            if let Some((mt, lease)) = net::parse_dhcp(pkt.payload) {
+                                if mt == 2 { offer = Some(lease); break; }
+                            }
+                        }
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            let lease = match offer {
+                Some(l) => l,
+                None => { vga::term_puts("[dhcp] no OFFER received\n", vga::C_RED); return; }
+            };
+            vga::term_puts("[dhcp] OFFER ", vga::C_GREEN);
+            print_ipv4(lease.yiaddr);
+            vga::term_puts("  server ", vga::C_DIM);
+            print_ipv4(lease.server);
+            vga::term_puts("\n", 0);
+
+            // ── 3. DHCPREQUEST ──────────────────────────────────────────
+            vga::term_puts("[dhcp] REQUEST...\n", vga::C_CYAN);
+            net::build_dhcp(drv.nic.mac, xid, 3, Some(lease.yiaddr), Some(lease.server), &mut dhcp);
+            let n = net::build_udp(
+                drv.nic.mac, [0,0,0,0], net::DHCP_CLIENT_PORT,
+                bcast_mac, bcast_ip, net::DHCP_SERVER_PORT,
+                &dhcp, &mut frame,
+            ).unwrap_or(0);
+            if drv.send(&frame[..n]).is_err() {
+                vga::term_puts("[dhcp] REQUEST TX failed\n", vga::C_RED); return;
+            }
+
+            // ── 4. Wait for DHCPACK ──────────────────────────────────────
+            let mut ack: Option<net::DhcpLease> = None;
+            for _ in 0..2_000_000u32 {
+                if let Some((idx, _len)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(pkt) = net::parse_udp(f) {
+                        if pkt.dst_port == net::DHCP_CLIENT_PORT {
+                            if let Some((mt, lease)) = net::parse_dhcp(pkt.payload) {
+                                if mt == 5 { ack = Some(lease); break; }
+                            }
+                        }
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            let lease = match ack {
+                Some(l) => l,
+                None => { vga::term_puts("[dhcp] no ACK received\n", vga::C_RED); return; }
+            };
+
+            // ── Apply ───────────────────────────────────────────────────
+            unsafe { OUR_IP = lease.yiaddr; }
+            vga::term_puts("[dhcp] ACK  ip=", vga::C_GREEN);
+            print_ipv4(lease.yiaddr);
+            vga::term_puts(" mask=", vga::C_DIM); print_ipv4(lease.netmask);
+            vga::term_puts(" gw=",   vga::C_DIM); print_ipv4(lease.gateway);
+            vga::term_puts(" dns=",  vga::C_DIM); print_ipv4(lease.dns);
+            vga::term_puts("\n[dhcp] OUR_IP configured.\n", vga::C_GREEN);
         }
         "/ping" => {
             // Full ARP-then-ICMP-echo cycle.  Assumes the target is on the
@@ -1289,6 +1543,14 @@ fn try_create_app_via_ai(
 
     vga::term_puts("[give-up] could not produce a valid recipe in 4 rounds.\n", vga::C_RED);
     vga::term_puts("Try a simpler description, or write the recipe yourself.\n", vga::C_DIM);
+}
+
+/// Print an IPv4 as dotted-quad to the terminal.
+fn print_ipv4(ip: [u8; 4]) {
+    for (i, &b) in ip.iter().enumerate() {
+        if i > 0 { vga::term_putc(b'.', vga::C_DIM); }
+        vga::term_putu32(b as u32, vga::C_CYAN);
+    }
 }
 
 /// Parse a dotted-quad IPv4 like "192.168.1.1" into [u8; 4].

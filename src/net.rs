@@ -543,6 +543,302 @@ pub fn build_icmp_echo(
     Some(total)
 }
 
+// ── UDP layer ───────────────────────────────────────────────────────────────
+
+/// Build an Ethernet+IPv4+UDP frame.  Returns the total bytes written.
+pub fn build_udp(
+    our_mac: [u8; 6], our_ip: [u8; 4], src_port: u16,
+    dst_mac: [u8; 6], dst_ip: [u8; 4], dst_port: u16,
+    payload: &[u8], out: &mut [u8],
+) -> Option<usize> {
+    let udp_len  = 8 + payload.len();
+    let ip_len   = 20 + udp_len;
+    let total    = 14 + ip_len;
+    if out.len() < total { return None; }
+
+    // Eth
+    out[0..6].copy_from_slice(&dst_mac);
+    out[6..12].copy_from_slice(&our_mac);
+    out[12..14].copy_from_slice(&ET_IPV4.to_be_bytes());
+
+    // IPv4
+    out[14] = (4 << 4) | 5;
+    out[15] = 0;
+    out[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    out[18..20].copy_from_slice(&0u16.to_be_bytes());
+    out[20..22].copy_from_slice(&0u16.to_be_bytes());
+    out[22] = 64;
+    out[23] = IP_PROTO_UDP;
+    out[24..26].copy_from_slice(&0u16.to_be_bytes());
+    out[26..30].copy_from_slice(&our_ip);
+    out[30..34].copy_from_slice(&dst_ip);
+    let csum = ip_checksum(&out[14..14 + 20]);
+    out[24..26].copy_from_slice(&csum.to_be_bytes());
+
+    // UDP
+    let udp = 14 + 20;
+    out[udp..udp + 2].copy_from_slice(&src_port.to_be_bytes());
+    out[udp + 2..udp + 4].copy_from_slice(&dst_port.to_be_bytes());
+    out[udp + 4..udp + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    out[udp + 6..udp + 8].copy_from_slice(&0u16.to_be_bytes());   // checksum 0 = ignore (IPv4)
+    out[udp + 8..udp + 8 + payload.len()].copy_from_slice(payload);
+
+    Some(total)
+}
+
+/// Parsed UDP packet view.
+pub struct UdpPacket<'a> {
+    pub src_ip: [u8; 4],
+    pub dst_ip: [u8; 4],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+pub fn parse_udp(frame: &[u8]) -> Option<UdpPacket> {
+    let eth = parse_eth(frame)?;
+    if eth.ethertype != ET_IPV4 { return None; }
+    let ip = eth.payload;
+    if ip.len() < 20 { return None; }
+    if ip[0] >> 4 != 4 { return None; }
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip[9] != IP_PROTO_UDP || ip.len() < ihl + 8 { return None; }
+    let src_ip: [u8; 4] = ip[12..16].try_into().ok()?;
+    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
+    let udp = &ip[ihl..];
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    let udp_len  = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    if udp_len < 8 || udp.len() < udp_len { return None; }
+    Some(UdpPacket {
+        src_ip, dst_ip, src_port, dst_port,
+        payload: &udp[8..udp_len],
+    })
+}
+
+// ── DHCP client ─────────────────────────────────────────────────────────────
+
+pub const DHCP_CLIENT_PORT: u16 = 68;
+pub const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_MAGIC: u32 = 0x63825363;
+
+#[derive(Default, Clone, Copy)]
+pub struct DhcpLease {
+    pub yiaddr:   [u8; 4],
+    pub server:   [u8; 4],
+    pub gateway:  [u8; 4],
+    pub netmask:  [u8; 4],
+    pub dns:      [u8; 4],
+}
+
+/// Build a DHCP DISCOVER (or REQUEST when `requested_ip` is set).
+pub fn build_dhcp(
+    our_mac: [u8; 6],
+    xid: u32,
+    msg_type: u8,           // 1=DISCOVER, 3=REQUEST
+    requested_ip: Option<[u8; 4]>,
+    server_ip: Option<[u8; 4]>,
+    out: &mut [u8; 300],
+) {
+    // Zero everything first.
+    for b in out.iter_mut() { *b = 0; }
+
+    out[0] = 1;                                  // op = BOOTREQUEST
+    out[1] = 1;                                  // htype = Ethernet
+    out[2] = 6;                                  // hlen
+    out[3] = 0;                                  // hops
+    out[4..8].copy_from_slice(&xid.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());     // secs
+    out[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+    // ciaddr 12..16, yiaddr 16..20, siaddr 20..24, giaddr 24..28 — all zero
+    out[28..34].copy_from_slice(&our_mac);
+    // sname 44..108, file 108..236 — zero
+    out[236..240].copy_from_slice(&DHCP_MAGIC.to_be_bytes());
+
+    // Options at offset 240
+    let mut o = 240usize;
+    // Option 53: message type
+    out[o] = 53; out[o + 1] = 1; out[o + 2] = msg_type; o += 3;
+
+    if let Some(ip) = requested_ip {
+        // Option 50: requested IP
+        out[o] = 50; out[o + 1] = 4;
+        out[o + 2..o + 6].copy_from_slice(&ip);
+        o += 6;
+    }
+    if let Some(sip) = server_ip {
+        // Option 54: server identifier
+        out[o] = 54; out[o + 1] = 4;
+        out[o + 2..o + 6].copy_from_slice(&sip);
+        o += 6;
+    }
+
+    // Option 55: Parameter Request List = subnet, router, DNS
+    out[o] = 55; out[o + 1] = 3;
+    out[o + 2] = 1;       // subnet mask
+    out[o + 3] = 3;       // router
+    out[o + 4] = 6;       // DNS
+    o += 5;
+
+    // Option 255: end
+    out[o] = 255;
+}
+
+/// Parse a DHCP reply (OFFER or ACK) out of a UDP payload.
+pub fn parse_dhcp(payload: &[u8]) -> Option<(u8, DhcpLease)> {
+    if payload.len() < 240 { return None; }
+    let magic = u32::from_be_bytes([payload[236], payload[237], payload[238], payload[239]]);
+    if magic != DHCP_MAGIC { return None; }
+
+    let mut lease = DhcpLease::default();
+    lease.yiaddr.copy_from_slice(&payload[16..20]);
+
+    let mut msg_type = 0u8;
+    let mut i = 240usize;
+    while i < payload.len() {
+        let opt = payload[i];
+        if opt == 0 { i += 1; continue; }
+        if opt == 255 { break; }
+        if i + 1 >= payload.len() { break; }
+        let len = payload[i + 1] as usize;
+        if i + 2 + len > payload.len() { break; }
+        match opt {
+            53 if len == 1 => { msg_type = payload[i + 2]; }
+            1 if len == 4 => { lease.netmask.copy_from_slice(&payload[i+2..i+6]); }
+            3 if len >= 4 => { lease.gateway.copy_from_slice(&payload[i+2..i+6]); }
+            6 if len >= 4 => { lease.dns.copy_from_slice(&payload[i+2..i+6]); }
+            54 if len == 4 => { lease.server.copy_from_slice(&payload[i+2..i+6]); }
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    if msg_type == 0 { return None; }
+    Some((msg_type, lease))
+}
+
+// ── TCP layer (minimal) ─────────────────────────────────────────────────────
+//
+// Just enough to do a 3-way handshake, send one payload, receive whatever
+// the peer sends back, and tear down.  No retransmission, no window
+// management beyond a hard-coded receive window, no SACK, no congestion
+// control, no fragmentation.  Single-connection.
+
+pub const IP_PROTO_TCP: u8 = 6;
+
+pub const TCP_FIN: u8 = 1 << 0;
+pub const TCP_SYN: u8 = 1 << 1;
+pub const TCP_RST: u8 = 1 << 2;
+pub const TCP_PSH: u8 = 1 << 3;
+pub const TCP_ACK: u8 = 1 << 4;
+
+/// Compute the TCP/UDP IPv4 pseudo-header checksum.  data = TCP header + payload.
+pub fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    // Pseudo-header
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += IP_PROTO_TCP as u32;
+    sum += data.len() as u32;
+    // Data
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() { sum += (data[i] as u32) << 8; }
+    while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+    !(sum as u16)
+}
+
+/// Build an Eth+IP+TCP frame with no options.  Returns total bytes used.
+pub fn build_tcp(
+    our_mac: [u8; 6], our_ip: [u8; 4], src_port: u16,
+    dst_mac: [u8; 6], dst_ip: [u8; 4], dst_port: u16,
+    seq: u32, ack: u32, flags: u8, window: u16,
+    payload: &[u8], out: &mut [u8],
+) -> Option<usize> {
+    let tcp_len = 20 + payload.len();
+    let ip_len  = 20 + tcp_len;
+    let total   = 14 + ip_len;
+    if out.len() < total { return None; }
+
+    out[0..6].copy_from_slice(&dst_mac);
+    out[6..12].copy_from_slice(&our_mac);
+    out[12..14].copy_from_slice(&ET_IPV4.to_be_bytes());
+
+    out[14] = (4 << 4) | 5;
+    out[15] = 0;
+    out[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    out[18..20].copy_from_slice(&0u16.to_be_bytes());
+    out[20..22].copy_from_slice(&0u16.to_be_bytes());
+    out[22] = 64;
+    out[23] = IP_PROTO_TCP;
+    out[24..26].copy_from_slice(&0u16.to_be_bytes());
+    out[26..30].copy_from_slice(&our_ip);
+    out[30..34].copy_from_slice(&dst_ip);
+    let ipcs = ip_checksum(&out[14..14 + 20]);
+    out[24..26].copy_from_slice(&ipcs.to_be_bytes());
+
+    let t = 14 + 20;
+    out[t   ..t+ 2].copy_from_slice(&src_port.to_be_bytes());
+    out[t+ 2..t+ 4].copy_from_slice(&dst_port.to_be_bytes());
+    out[t+ 4..t+ 8].copy_from_slice(&seq.to_be_bytes());
+    out[t+ 8..t+12].copy_from_slice(&ack.to_be_bytes());
+    out[t+12] = 5 << 4;            // data offset = 5 (no options), reserved=0
+    out[t+13] = flags;
+    out[t+14..t+16].copy_from_slice(&window.to_be_bytes());
+    out[t+16..t+18].copy_from_slice(&0u16.to_be_bytes());   // checksum (set below)
+    out[t+18..t+20].copy_from_slice(&0u16.to_be_bytes());   // urgent
+    out[t+20..t+20+payload.len()].copy_from_slice(payload);
+    let tcs = tcp_checksum(our_ip, dst_ip, &out[t..t+tcp_len]);
+    out[t+16..t+18].copy_from_slice(&tcs.to_be_bytes());
+
+    Some(total)
+}
+
+/// Parsed TCP segment view.
+pub struct TcpSeg<'a> {
+    pub src_ip:   [u8; 4],
+    pub dst_ip:   [u8; 4],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq:      u32,
+    pub ack:      u32,
+    pub flags:    u8,
+    pub window:   u16,
+    pub payload:  &'a [u8],
+}
+
+pub fn parse_tcp(frame: &[u8]) -> Option<TcpSeg> {
+    let eth = parse_eth(frame)?;
+    if eth.ethertype != ET_IPV4 { return None; }
+    let ip = eth.payload;
+    if ip.len() < 20 { return None; }
+    if ip[0] >> 4 != 4 { return None; }
+    let ihl = ((ip[0] & 0xF) as usize) * 4;
+    if ip[9] != IP_PROTO_TCP || ip.len() < ihl + 20 { return None; }
+    let src_ip: [u8; 4] = ip[12..16].try_into().ok()?;
+    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
+    let total_len = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    let tcp_total = total_len.checked_sub(ihl)?;
+    let tcp = &ip[ihl..ihl + tcp_total.min(ip.len() - ihl)];
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    let data_off = ((tcp[12] >> 4) as usize) * 4;
+    let flags = tcp[13];
+    let window = u16::from_be_bytes([tcp[14], tcp[15]]);
+    if tcp.len() < data_off { return None; }
+    Some(TcpSeg {
+        src_ip, dst_ip, src_port, dst_port,
+        seq, ack, flags, window,
+        payload: &tcp[data_off..],
+    })
+}
+
 /// Inspect an Ethernet frame: if it's an ICMP echo REPLY (type 0) to our
 /// IP, return Some((ident, seq, payload_len)) — caller can then declare
 /// the ping a success.
