@@ -1746,12 +1746,16 @@ fn do_install(arg: &str, mod_data: &[u8]) {
     }
 
     // ── Step 1: bootable MBR ─────────────────────────────────────────────
-    vga::term_puts("[install] writing bootable MBR... ", vga::C_CYAN);
+    vga::term_puts("[install] writing bootable MBR (stage1)... ", vga::C_CYAN);
     let mut hdr = bootstub::MBR_STUB;
-    hdr[440..444].copy_from_slice(b"MTOS");
-    hdr[444..448].copy_from_slice(&(mod_data.len() as u32).to_le_bytes());
-    hdr[448..452].copy_from_slice(&4097u32.to_le_bytes());
-    hdr[452..456].copy_from_slice(&1u32.to_le_bytes());
+    // We can no longer overlay metadata at byte 440 — stage1 uses byte 0x180
+    // for its drive byte AND the partition table area is now compiled code.
+    // Put metadata RIGHT BEFORE the boot signature: bytes 480..510 (30 free).
+    hdr[480..484].copy_from_slice(b"MTOS");
+    hdr[484..488].copy_from_slice(&(mod_data.len() as u32).to_le_bytes());
+    hdr[488..492].copy_from_slice(&(4097u32 + bootstub::STAGE2_SECTORS as u32).to_le_bytes());
+    // bundle now starts AFTER stage2 sectors
+    hdr[492..496].copy_from_slice(&((bootstub::STAGE2_SECTORS as u32) + 1).to_le_bytes());
     match target_write(&target, 0, &hdr) {
         Ok(()) => vga::term_puts("OK\n", vga::C_GREEN),
         Err(e) => {
@@ -1761,6 +1765,25 @@ fn do_install(arg: &str, mod_data: &[u8]) {
             return;
         }
     }
+
+    // ── Step 1b: write stage2 (the 32-bit protected-mode bring-up) ─────
+    vga::term_puts("[install] writing stage2 (", vga::C_CYAN);
+    vga::term_putu32(bootstub::STAGE2_SECTORS as u32, vga::C_ORANGE);
+    vga::term_puts(" sectors)... ", vga::C_CYAN);
+    let stage2 = bootstub::STAGE2;
+    let mut all_ok = true;
+    for sector in 0..(bootstub::STAGE2_SECTORS as usize) {
+        let lba = 1u64 + sector as u64;
+        let off = sector * 512;
+        if let Err(e) = target_write(&target, lba, &stage2[off..off + 512]) {
+            vga::term_puts("FAIL: ", vga::C_RED);
+            vga::term_puts(e, vga::C_RED);
+            vga::term_puts("\n", 0);
+            all_ok = false;
+            break;
+        }
+    }
+    if all_ok { vga::term_puts("OK\n", vga::C_GREEN); } else { return; }
 
     // ── Step 2: stream bundle ────────────────────────────────────────────
     vga::term_puts("[install] writing bundle (", vga::C_CYAN);
@@ -1790,13 +1813,15 @@ fn do_install(arg: &str, mod_data: &[u8]) {
     // ── Step 3: verify ───────────────────────────────────────────────────
     let mut verify = [0u8; 512];
     if target_read(&target, 0, &mut verify).is_ok()
-        && &verify[440..444] == b"MTOS"
+        && &verify[480..484] == b"MTOS"
         && verify[510] == 0x55 && verify[511] == 0xAA
     {
-        vga::term_puts("[install] verified MBR magic + boot signature.\n", vga::C_GREEN);
-        vga::term_puts("[install] INSTALL COMPLETE — disk is now bootable.\n", vga::C_GREEN);
-        vga::term_puts("[install] (Boots to a banner.  Real kernel-from-disk is\n", vga::C_DIM);
-        vga::term_puts("[install]  queued.  For full OS use ISO + /install.)\n", vga::C_DIM);
+        vga::term_puts("[install] verified stage1 + boot signature.\n", vga::C_GREEN);
+        vga::term_puts("[install] INSTALL COMPLETE — disk boots into stage2:\n", vga::C_GREEN);
+        vga::term_puts("[install]   stage1 (LBA 0) -> stage2 (LBA 1..)\n", vga::C_DIM);
+        vga::term_puts("[install]   stage2: A20 + GDT + 32-bit PM\n", vga::C_DIM);
+        vga::term_puts("[install]   Display: VGA text 0xB8000 'MATRIXOS BOOT OK'\n", vga::C_DIM);
+        vga::term_puts("[install] (Long-mode + kernel-from-disk are the next PR.)\n", vga::C_DIM);
     } else {
         vga::term_puts("[install] WARNING: verify failed\n", vga::C_RED);
     }
