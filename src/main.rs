@@ -26,6 +26,10 @@ pub mod irq;
 pub mod ahci;
 pub mod fs;
 pub mod mouse;
+pub mod audio;
+pub mod rng;
+pub mod planner;
+pub mod executor;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -348,6 +352,9 @@ fn handle_slash_command(
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
+            vga::term_puts("  /plan <natural-language>   AI emits JSON plan + executes\n", vga::C_DIM);
+            vga::term_puts("  /beep [freq] [ms]  PC-speaker tone\n", vga::C_DIM);
+            vga::term_puts("  /rand              random 64-bit value\n", vga::C_DIM);
             vga::term_puts("Hotkeys: F1 chat · F2 code · TAB toggle auto · F5 clear\n", vga::C_DIM);
         }
         "/apps" => {
@@ -1343,6 +1350,31 @@ fn handle_slash_command(
             }
             vga::term_puts("  no ICMP reply received\n", vga::C_RED);
         }
+        "/beep" => {
+            let (freq_s, ms_s) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None    => (arg, ""),
+            };
+            let freq = parse_u32_safe(freq_s).unwrap_or(880);
+            let ms   = parse_u32_safe(ms_s).unwrap_or(150);
+            audio::beep_blocking(freq, ms);
+            vga::term_puts("[beep] ", vga::C_DIM);
+            vga::term_putu32(freq, vga::C_ORANGE);
+            vga::term_puts(" Hz / ", vga::C_DIM);
+            vga::term_putu32(ms, vga::C_ORANGE);
+            vga::term_puts(" ms\n", vga::C_DIM);
+        }
+        "/rand" => {
+            let n = rng::rand_u64();
+            vga::term_puts("rand = 0x", vga::C_DIM);
+            // 16 hex digits
+            for i in (0..16).rev() {
+                let d = ((n >> (i * 4)) & 0xF) as u8;
+                let c = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
+                vga::term_putc(c, vga::C_ORANGE);
+            }
+            vga::term_puts(if rng::has_hardware() {"  (RDRAND)\n"} else {"  (PRNG)\n"}, vga::C_DIM);
+        }
         "/meminfo" => {
             let used = allocator::heap_used();
             let free = allocator::heap_free();
@@ -1474,6 +1506,106 @@ fn handle_slash_command(
 // requires 16-bit real-mode loader code we don't have here.  But the data
 // layout is documented and verifiable, and a future limine-or-bootsect
 // fix can read from this image instead of the CD.
+
+// ── Planner pipeline: User → LLM → JSON → Executor ─────────────────────────
+
+const PLAN_SYSTEM: &str = "\
+You are the MatrixOS planner.  Given the user's request in natural language,\
+emit ONLY a JSON array of action objects — no prose, no markdown fences.\n\
+Each object: {\"action\":\"VERB\", ...key:value pairs}.\n\
+Available verbs:\n\
+  say     text=\"...\"                              print text\n\
+  beep    freq=NNNN  ms=NNN                       (defaults 880, 150)\n\
+  wait    ms=NNN                                   sleep\n\
+  clear                                            clear screen\n\
+  set     key=max_chat|max_code|auto  value=...    change a setting\n\
+  run     app=NAME                                 run an installed app\n\
+  fs_save name=...   body=\"...\"                    write a file\n\
+  fs_load name=...                                  print file\n\
+  fs_list                                           list files\n\
+  fs_rm   name=...                                  delete file\n\
+  rand                                              print a random u64\n\
+Keep plans short (≤ 6 steps).  Output JSON only.";
+
+const PLAN_FIX_SYSTEM: &str = "\
+You are a strict JSON-validator for the MatrixOS planner DSL.\
+The user gives you a broken plan plus a parse error.  Output ONLY the\
+corrected plan as a JSON array.  No prose.";
+
+fn do_plan(
+    user_request: &str,
+    chat_gguf: &gguf::Gguf, chat_cfg: &model::ModelConfig,
+    chat_kv: &mut model::KVCache, chat_tok: &Option<tokenizer::Tokenizer>,
+    code_gguf: &gguf::Gguf, code_cfg: &model::ModelConfig,
+    code_kv: &mut model::KVCache, code_tok: &Option<tokenizer::Tokenizer>,
+    scratch: &mut model::ForwardScratch,
+    registry: &mut apps::Registry,
+    max_new_chat: &mut usize,
+    max_new_code: &mut usize,
+    auto_pick: &mut bool,
+) {
+    let req = user_request.trim();
+    if req.is_empty() {
+        vga::term_puts("usage: /plan <natural-language request>\n", vga::C_RED);
+        return;
+    }
+
+    vga::term_puts("[plan] request: ", vga::C_DIM);
+    vga::term_puts(req, vga::C_TEXT);
+    vga::term_puts("\n[plan] chat-AI generating plan...\n", vga::C_CYAN);
+
+    // Round 1: chat-AI emits JSON plan.
+    let mut plan_text = ai_turn_capture(
+        chat_gguf, chat_cfg, chat_kv, scratch, chat_tok,
+        PLAN_SYSTEM, req, 256,
+    );
+
+    const MAX_ROUNDS: usize = 3;
+    for round in 1..=MAX_ROUNDS {
+        match planner::parse_plan(&plan_text) {
+            Ok(actions) if !actions.is_empty() => {
+                vga::term_puts("[plan] parsed ", vga::C_GREEN);
+                vga::term_putu32(actions.len() as u32, vga::C_ORANGE);
+                vga::term_puts(" actions, executing:\n", vga::C_GREEN);
+                let results = executor::run_plan(
+                    &actions, registry, max_new_chat, max_new_code, auto_pick,
+                );
+                let ok_count  = results.iter().filter(|r| r.ok).count();
+                let fail_count = results.iter().filter(|r| !r.ok).count();
+                vga::term_puts("[plan] done: ", vga::C_DIM);
+                vga::term_putu32(ok_count as u32, vga::C_GREEN);
+                vga::term_puts(" OK, ", vga::C_DIM);
+                vga::term_putu32(fail_count as u32, if fail_count > 0 { vga::C_RED } else { vga::C_DIM });
+                vga::term_puts(" failed\n", vga::C_DIM);
+                return;
+            }
+            Ok(_) => {
+                vga::term_puts("[plan] empty plan, asking code-AI to fix\n", vga::C_ORANGE);
+            }
+            Err(e) => {
+                vga::term_puts("[plan] parse error @ ", vga::C_RED);
+                vga::term_putu32(e.byte_offset as u32, vga::C_RED);
+                vga::term_puts(": ", vga::C_RED);
+                vga::term_puts(e.message, vga::C_RED);
+                vga::term_puts("\n", 0);
+            }
+        }
+        if round == MAX_ROUNDS { break; }
+
+        // Code-AI fix attempt
+        vga::term_puts("[plan] round ", vga::C_CYAN);
+        vga::term_putu32((round + 1) as u32, vga::C_CYAN);
+        vga::term_puts(" code-AI fixing...\n", vga::C_CYAN);
+        let mut fix_prompt = alloc::string::String::from("Broken plan:\n");
+        fix_prompt.push_str(&plan_text);
+        fix_prompt.push_str("\n\nRewrite as valid JSON.");
+        plan_text = ai_turn_capture(
+            code_gguf, code_cfg, code_kv, scratch, code_tok,
+            PLAN_FIX_SYSTEM, &fix_prompt, 320,
+        );
+    }
+    vga::term_puts("[plan] gave up after 3 rounds — try rephrasing\n", vga::C_RED);
+}
 
 /// Where to install — either an IDE drive slot (0..3) or an AHCI port.
 enum InstallTarget {
@@ -2216,6 +2348,14 @@ pub extern "C" fn _start() -> ! {
         vga::term_puts("[OK] AVX2 not present — using SSE3 (4-wide)\n", vga::C_DIM);
     }
 
+    // Initialise the RNG (probes CPUID for RDRAND, seeds fallback PRNG).
+    rng::init();
+    vga::term_puts(
+        if rng::has_hardware() { "[OK] RNG (RDRAND hardware)\n" }
+        else                  { "[OK] RNG (xorshift PRNG)\n" },
+        vga::C_GREEN,
+    );
+
     // Calibrate TSC via the 8254 PIT so /uptime and tok/s are honest.
     // Skipping calibration is OK — TSC_HZ defaults to 3 GHz.
     unsafe { math::calibrate_tsc_via_pit(); }
@@ -2612,6 +2752,23 @@ pub extern "C" fn _start() -> ! {
                 core::str::from_utf8(&buf[9..len]).unwrap_or("")
             } else { "" };
             do_install(arg, mod_data);
+            vga::term_puts("\n", 0);
+            continue;
+        }
+
+        // ── /plan <natural-language>: User→LLM→Planner→Executor ─────────
+        if len > 6 && &buf[..6] == b"/plan " {
+            let arg = core::str::from_utf8(&buf[6..len]).unwrap_or("");
+            do_plan(
+                arg,
+                &chat_gguf, &chat_cfg, &mut chat_kv, &chat_tok,
+                &code_gguf, &code_cfg, &mut code_kv, &code_tok,
+                &mut scratch,
+                &mut registry,
+                &mut max_new_chat,
+                &mut max_new_code,
+                &mut auto_pick,
+            );
             vga::term_puts("\n", 0);
             continue;
         }
