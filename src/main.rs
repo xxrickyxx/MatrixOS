@@ -96,6 +96,12 @@ static mut HHDM_OFFSET: u64 = 0;
 /// (we don't speak DHCP yet, so the user can /net ip-set if needed).
 static mut OUR_IP: [u8; 4] = [10, 0, 2, 15];
 
+/// DNS server (set by /dhcp ACK or /net dns).  Default = VBox NAT.
+static mut DNS_IP: [u8; 4] = [10, 0, 2, 3];
+
+/// Gateway (set by /dhcp ACK).  Default = VBox NAT.
+static mut GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+
 // ── SSE enablement ────────────────────────────────────────────────────────────
 
 unsafe fn enable_sse() {
@@ -231,7 +237,9 @@ fn handle_slash_command(
             vga::term_puts("  /show <name>       print recipe source\n", vga::C_DIM);
             vga::term_puts("  /delete <name>     remove a non-builtin app\n", vga::C_DIM);
             vga::term_puts("  /disks             list controllers + IDENTIFY drives\n", vga::C_DIM);
-            vga::term_puts("  /install <slot>    dry-run install probe\n", vga::C_DIM);
+            vga::term_puts("  /install <slot>             IDE install (dry-run)\n", vga::C_DIM);
+            vga::term_puts("  /install ahci <port>        SATA install (dry-run)\n", vga::C_DIM);
+            vga::term_puts("  /install ... confirm        actually write\n", vga::C_DIM);
             vga::term_puts("  /sysinfo           print system stats\n", vga::C_DIM);
             vga::term_puts("  /set max_chat=N    chat response length (32..512)\n", vga::C_DIM);
             vga::term_puts("  /set max_code=N    code response length (32..640)\n", vga::C_DIM);
@@ -245,6 +253,8 @@ fn handle_slash_command(
             vga::term_puts("  /ping <ip>         ARP + ICMP-echo a host\n", vga::C_DIM);
             vga::term_puts("  /dhcp              DHCP DISCOVER+REQUEST, auto-config IP\n", vga::C_DIM);
             vga::term_puts("  /tcp <ip> <port> <text>   TCP handshake + send + read\n", vga::C_DIM);
+            vga::term_puts("  /resolve <host>    DNS A-record lookup\n", vga::C_DIM);
+            vga::term_puts("  /http <host> [path]   DNS + TCP GET + print body\n", vga::C_DIM);
             vga::term_puts("  /meminfo           heap used / free\n", vga::C_DIM);
             vga::term_puts("  /uptime            seconds since boot (TSC)\n", vga::C_DIM);
             vga::term_puts("  /clear             clear chat scrollback\n", vga::C_DIM);
@@ -762,6 +772,194 @@ fn handle_slash_command(
             }
             vga::term_puts("\n[tcp] poll timeout (connection still open)\n", vga::C_DIM);
         }
+        "/http" => {
+            // Format: /http <host> [path]
+            // Resolves host via DNS, opens TCP:80, GETs path, prints body.
+            if arg.is_empty() {
+                vga::term_puts("usage: /http <host> [path]\n", vga::C_RED); return;
+            }
+            let (host, path) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None => (arg, "/"),
+            };
+            let path = if path.is_empty() { "/" } else { path };
+
+            vga::term_puts("[http] resolving ", vga::C_CYAN);
+            vga::term_puts(host, vga::C_CYAN);
+            vga::term_puts("...\n", vga::C_DIM);
+            let target_ip = match resolve_host(host) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    vga::term_puts("[http] DNS error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                    return;
+                }
+            };
+            vga::term_puts("[http] ", vga::C_DIM);
+            vga::term_puts(host, vga::C_CYAN);
+            vga::term_puts(" -> ", vga::C_DIM);
+            print_ipv4(target_ip);
+            vga::term_puts("\n", 0);
+
+            // Build the request inline using alloc::String to avoid format!.
+            let mut req = alloc::string::String::with_capacity(host.len() + path.len() + 50);
+            req.push_str("GET ");
+            req.push_str(path);
+            req.push_str(" HTTP/1.0\r\nHost: ");
+            req.push_str(host);
+            req.push_str("\r\nUser-Agent: MatrixOS\r\nConnection: close\r\n\r\n");
+
+            // Reuse the same TCP path used by /tcp.  We open a new Driver
+            // because resolve_host already brought one up; that's fine — the
+            // NIC is fast to re-init.
+            let hhdm = unsafe { HHDM_OFFSET };
+            let our_ip = unsafe { OUR_IP };
+            let gateway = unsafe { GATEWAY_IP };
+            let nic = match net::probe(hhdm) {
+                Some(n) => n,
+                None => { vga::term_puts("no NIC\n", vga::C_RED); return; }
+            };
+            let mut drv = net::Driver::init(nic, hhdm);
+            let mut cache = net::ArpCache::new();
+
+            // ARP gateway (HTTP traffic usually leaves the subnet)
+            drv.send_arp(our_ip, gateway).ok();
+            let mut gw_mac: Option<[u8; 6]> = None;
+            for _ in 0..400_000u32 {
+                if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(reply) = net::process_arp(f, &mut cache, drv.nic.mac, our_ip) {
+                        let _ = drv.send(&reply);
+                    }
+                    if let Some(m) = cache.lookup(gateway) { gw_mac = Some(m); break; }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            let gw_mac = match gw_mac {
+                Some(m) => m,
+                None => { vga::term_puts("[http] gateway ARP timeout\n", vga::C_RED); return; }
+            };
+
+            // TCP handshake
+            let src_port: u16 = 49152 + ((math::rdtsc() as u16) & 0x0FFF);
+            let our_isn: u32 = math::rdtsc() as u32;
+            let mut frame = [0u8; 1500];
+            let n = net::build_tcp(
+                drv.nic.mac, our_ip, src_port, gw_mac, target_ip, 80,
+                our_isn, 0, net::TCP_SYN, 8192, &[], &mut frame
+            ).unwrap_or(0);
+            vga::term_puts("[http] SYN ", vga::C_CYAN);
+            print_ipv4(target_ip);
+            vga::term_puts(":80\n", vga::C_DIM);
+            if drv.send(&frame[..n]).is_err() {
+                vga::term_puts("[http] SYN TX failed\n", vga::C_RED); return;
+            }
+
+            let mut peer_seq = 0u32;
+            let mut got = false;
+            for _ in 0..2_000_000u32 {
+                if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(seg) = net::parse_tcp(f) {
+                        if seg.dst_port == src_port
+                            && seg.flags & net::TCP_SYN != 0
+                            && seg.flags & net::TCP_ACK != 0
+                        {
+                            peer_seq = seg.seq;
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            if !got { vga::term_puts("[http] SYN-ACK timeout\n", vga::C_RED); return; }
+
+            let our_seq = our_isn.wrapping_add(1);
+            let our_ack = peer_seq.wrapping_add(1);
+            // ACK
+            let n = net::build_tcp(
+                drv.nic.mac, our_ip, src_port, gw_mac, target_ip, 80,
+                our_seq, our_ack, net::TCP_ACK, 8192, &[], &mut frame
+            ).unwrap_or(0);
+            let _ = drv.send(&frame[..n]);
+
+            // Send request
+            let n = net::build_tcp(
+                drv.nic.mac, our_ip, src_port, gw_mac, target_ip, 80,
+                our_seq, our_ack, net::TCP_PSH | net::TCP_ACK, 8192,
+                req.as_bytes(), &mut frame
+            ).unwrap_or(0);
+            vga::term_puts("[http] GET ", vga::C_DIM);
+            vga::term_puts(path, vga::C_CYAN);
+            vga::term_puts("\n[http] ── response ──\n", vga::C_DIM);
+            let _ = drv.send(&frame[..n]);
+            let mut payload_seq = our_seq.wrapping_add(req.len() as u32);
+
+            // Read response
+            let mut total_rx = 0u32;
+            for _ in 0..5_000_000u32 {
+                let action: Option<(u32, u8, alloc::vec::Vec<u8>)> = if let Some((idx, _)) = drv.poll_rx() {
+                    let f = drv.rx_frame(idx);
+                    if let Some(seg) = net::parse_tcp(f) {
+                        if seg.dst_port == src_port {
+                            let payload: alloc::vec::Vec<u8> = seg.payload.to_vec();
+                            let len_consumed = payload.len() as u32
+                                             + if seg.flags & net::TCP_FIN != 0 { 1 } else { 0 };
+                            Some((seg.seq.wrapping_add(len_consumed), seg.flags, payload))
+                        } else { None }
+                    } else { None }
+                } else { None };
+
+                if let Some((peer_ack, flags, payload)) = action {
+                    for &b in &payload {
+                        if (32..127).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                            vga::term_putc(b, vga::C_TEXT);
+                        }
+                    }
+                    total_rx += payload.len() as u32;
+                    let tcp_flags = if flags & net::TCP_FIN != 0 {
+                        net::TCP_FIN | net::TCP_ACK
+                    } else { net::TCP_ACK };
+                    let n = net::build_tcp(
+                        drv.nic.mac, our_ip, src_port, gw_mac, target_ip, 80,
+                        payload_seq, peer_ack, tcp_flags, 8192, &[], &mut frame
+                    ).unwrap_or(0);
+                    let _ = drv.send(&frame[..n]);
+                    if flags & net::TCP_FIN != 0 {
+                        vga::term_puts("\n[http] connection closed.  ", vga::C_DIM);
+                        vga::term_putu32(total_rx, vga::C_ORANGE);
+                        vga::term_puts(" bytes received\n", vga::C_DIM);
+                        return;
+                    }
+                }
+                unsafe { core::arch::asm!("pause"); }
+            }
+            vga::term_puts("\n[http] poll timeout\n", vga::C_DIM);
+        }
+        "/resolve" => {
+            if arg.is_empty() {
+                vga::term_puts("usage: /resolve <hostname>\n", vga::C_RED); return;
+            }
+            vga::term_puts("[dns] resolving ", vga::C_CYAN);
+            vga::term_puts(arg, vga::C_CYAN);
+            vga::term_puts(" via ", vga::C_DIM);
+            print_ipv4(unsafe { DNS_IP });
+            vga::term_puts("\n", 0);
+            match resolve_host(arg) {
+                Ok(ip) => {
+                    vga::term_puts("  -> ", vga::C_GREEN);
+                    print_ipv4(ip);
+                    vga::term_puts("\n", 0);
+                }
+                Err(e) => {
+                    vga::term_puts("  error: ", vga::C_RED);
+                    vga::term_puts(e, vga::C_RED);
+                    vga::term_puts("\n", 0);
+                }
+            }
+        }
         "/dhcp" => {
             // Full 4-way DHCP exchange to auto-configure our IP, gateway,
             // netmask, DNS.  Broadcast media so no ARP needed up front.
@@ -847,7 +1045,11 @@ fn handle_slash_command(
             };
 
             // ── Apply ───────────────────────────────────────────────────
-            unsafe { OUR_IP = lease.yiaddr; }
+            unsafe {
+                OUR_IP     = lease.yiaddr;
+                GATEWAY_IP = lease.gateway;
+                if lease.dns != [0; 4] { DNS_IP = lease.dns; }
+            }
             vga::term_puts("[dhcp] ACK  ip=", vga::C_GREEN);
             print_ipv4(lease.yiaddr);
             vga::term_puts(" mask=", vga::C_DIM); print_ipv4(lease.netmask);
@@ -1086,56 +1288,129 @@ fn handle_slash_command(
 // layout is documented and verifiable, and a future limine-or-bootsect
 // fix can read from this image instead of the CD.
 
+/// Where to install — either an IDE drive slot (0..3) or an AHCI port.
+enum InstallTarget {
+    Ide(ata::DriveAddr),
+    Ahci(u8 /* port */),
+}
+
+/// Read 1 sector from either target.
+fn target_read(t: &InstallTarget, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    match t {
+        InstallTarget::Ide(addr) => ata::read_sectors(*addr, lba as u32, 1, buf),
+        InstallTarget::Ahci(port) => unsafe {
+            ahci::read_sectors(HHDM_OFFSET, *port, lba, 1, buf)
+        },
+    }
+}
+
+/// Write 1 sector (used for MBR + verify).
+fn target_write(t: &InstallTarget, lba: u64, buf: &[u8]) -> Result<(), &'static str> {
+    match t {
+        InstallTarget::Ide(addr) => ata::write_sectors(*addr, lba as u32, 1, buf),
+        InstallTarget::Ahci(port) => unsafe {
+            ahci::write_sectors(HHDM_OFFSET, *port, lba, 1, buf)
+        },
+    }
+}
+
+/// Stream the bundle.  Chunked at 32 sectors/call (AHCI PRDT entry limit
+/// in our driver; IDE uses 64 in its own `install_image`).
+fn target_stream(t: &InstallTarget, lba_start: u64, data: &[u8],
+                 mut progress: impl FnMut(usize, usize)) -> Result<u32, &'static str> {
+    match t {
+        InstallTarget::Ide(addr) => {
+            ata::install_image(*addr, lba_start as u32, data, |w, tot| progress(w, tot))
+        }
+        InstallTarget::Ahci(port) => {
+            const SECTORS_PER_CALL: usize = 32;
+            const BYTES_PER_CALL:   usize = SECTORS_PER_CALL * 512;
+            let total = data.len();
+            let mut written = 0usize;
+            let mut lba = lba_start;
+            let mut tmp = [0u8; BYTES_PER_CALL];
+            while written < total {
+                let n = (total - written).min(BYTES_PER_CALL);
+                tmp[..n].copy_from_slice(&data[written..written + n]);
+                if n < BYTES_PER_CALL {
+                    for b in &mut tmp[n..] { *b = 0; }
+                }
+                let sectors = ((n + 511) / 512) as u16;
+                unsafe {
+                    ahci::write_sectors(HHDM_OFFSET, *port, lba, sectors, &tmp[..sectors as usize * 512])?;
+                }
+                lba     += sectors as u64;
+                written += n;
+                progress(written, total);
+            }
+            Ok((lba - lba_start) as u32)
+        }
+    }
+}
+
 fn do_install(arg: &str, mod_data: &[u8]) {
     let arg = arg.trim();
     if arg.is_empty() {
-        vga::term_puts("usage: /install <slot>           dry-run\n", vga::C_RED);
+        vga::term_puts("usage: /install <slot>           dry-run (IDE slot)\n", vga::C_RED);
         vga::term_puts("       /install <slot> confirm   actually write\n", vga::C_RED);
+        vga::term_puts("       /install ahci <port> [confirm]  install on SATA\n", vga::C_RED);
         return;
     }
-    let (slot_s, rest) = match arg.find(char::is_whitespace) {
+
+    // Parse: support "ahci <port> [confirm]" or "<slot> [confirm]"
+    let (head, rest) = match arg.find(char::is_whitespace) {
         Some(i) => (&arg[..i], arg[i..].trim_start()),
         None    => (arg, ""),
     };
-    let slot = match parse_u32_safe(slot_s) {
-        Some(n) if (n as usize) < 4 => n as usize,
-        _ => { vga::term_puts("bad slot (0..3)\n", vga::C_RED); return; }
+    let (target, confirm_str): (InstallTarget, &str) = if head == "ahci" {
+        let (port_s, rest2) = match rest.find(char::is_whitespace) {
+            Some(i) => (&rest[..i], rest[i..].trim_start()),
+            None    => (rest, ""),
+        };
+        let port = match parse_u32_safe(port_s) {
+            Some(n) if n < 32 => n as u8,
+            _ => { vga::term_puts("bad AHCI port (0..31)\n", vga::C_RED); return; }
+        };
+        (InstallTarget::Ahci(port), rest2)
+    } else {
+        let slot = match parse_u32_safe(head) {
+            Some(n) if (n as usize) < 4 => n as usize,
+            _ => { vga::term_puts("bad IDE slot (0..3)\n", vga::C_RED); return; }
+        };
+        let probe = ata::probe_all();
+        let info = match probe.drives[slot].as_ref() {
+            Some(d) => d,
+            None    => { vga::term_puts("IDE slot empty — run /disks\n", vga::C_RED); return; }
+        };
+        if info.is_atapi {
+            vga::term_puts("target is ATAPI (CD/DVD), refusing.\n", vga::C_RED);
+            return;
+        }
+        (InstallTarget::Ide(info.addr), rest)
     };
-    let confirm = rest == "confirm";
+    let confirm = confirm_str.trim() == "confirm";
 
-    let probe = ata::probe_all();
-    let info = match &probe.drives[slot] {
-        Some(d) => d,
-        None    => { vga::term_puts("slot empty — run /disks\n", vga::C_RED); return; }
-    };
-    if info.is_atapi {
-        vga::term_puts("target is ATAPI (CD/DVD), refusing to install there.\n", vga::C_RED);
-        return;
+    // Capacity / banner depending on target kind.
+    let needed_bytes = mod_data.len() + 4096 * 512;
+    match &target {
+        InstallTarget::Ide(addr) => {
+            vga::term_puts("[install] target: IDE ", vga::C_DIM);
+            vga::term_puts(addr.label(), vga::C_GREEN);
+            vga::term_puts("\n", 0);
+        }
+        InstallTarget::Ahci(port) => {
+            vga::term_puts("[install] target: AHCI port ", vga::C_DIM);
+            vga::term_putu32(*port as u32, vga::C_GREEN);
+            vga::term_puts("\n", 0);
+        }
     }
-    let needed_bytes = mod_data.len() + 4096 * 512;   // bundle + reserved kernel area
-    let avail_bytes  = (info.sectors_28 as u64) * 512;
-    let target_label = info.addr.label();
-    let target_model = info.model_str();
-    let target_addr  = info.addr;
-
-    vga::term_puts("[install] target:  ", vga::C_DIM);
-    vga::term_puts(target_label, vga::C_GREEN);
-    vga::term_puts("  ", 0);
-    vga::term_puts(target_model, vga::C_TEXT);
-    vga::term_puts("\n[install] size:    ", vga::C_DIM);
-    vga::term_putu32(info.capacity_mb(), vga::C_ORANGE);
-    vga::term_puts(" MB\n[install] need:    ", vga::C_DIM);
+    vga::term_puts("[install] need:   ", vga::C_DIM);
     vga::term_putu32((needed_bytes / (1024 * 1024)) as u32, vga::C_ORANGE);
     vga::term_puts(" MB (kernel + bundle)\n", vga::C_DIM);
 
-    if (needed_bytes as u64) > avail_bytes {
-        vga::term_puts("[install] target is too small. abort.\n", vga::C_RED);
-        return;
-    }
-
-    // Always read sector 0 first to confirm the channel works.
+    // Read sector 0 to confirm read path works.
     let mut mbr = [0u8; 512];
-    if let Err(e) = ata::read_sectors(target_addr, 0, 1, &mut mbr) {
+    if let Err(e) = target_read(&target, 0, &mut mbr) {
         vga::term_puts("[install] read error: ", vga::C_RED);
         vga::term_puts(e, vga::C_RED);
         vga::term_puts("\n", 0);
@@ -1147,33 +1422,18 @@ fn do_install(arg: &str, mod_data: &[u8]) {
     vga::term_puts("\n", 0);
 
     if !confirm {
-        vga::term_puts("[install] dry-run only. To actually write:\n", vga::C_ORANGE);
-        vga::term_puts("  /install ", vga::C_ORANGE);
-        vga::term_puts(slot_s, vga::C_ORANGE);
-        vga::term_puts(" confirm\n", vga::C_ORANGE);
+        vga::term_puts("[install] dry-run only. Re-run with `confirm` to write.\n", vga::C_ORANGE);
         return;
     }
 
-    // ── Step 1: write the MatrixOS MBR with the bootstub to LBA 0 ───────
-    // The stub displays a banner + halts; full boot loader is the next PR.
-    // We OVERLAY the MATRIXOS metadata at byte 440 (4 bytes magic + 12 of
-    // sizes/offsets) so it sits inside the partition-table area where the
-    // bootstub doesn't reach.
+    // ── Step 1: bootable MBR ─────────────────────────────────────────────
     vga::term_puts("[install] writing bootable MBR... ", vga::C_CYAN);
     let mut hdr = bootstub::MBR_STUB;
-    // Overlay header in the "disk signature + reserved" area at byte 440
-    // (immediately before the partition table).  Layout:
-    //   440..444 = "MTOS"  (4-byte mini-magic)
-    //   444..448 = u32 bundle size
-    //   448..452 = u32 bundle LBA
-    //   452..456 = u32 kernel LBA
-    // Bytes 446..510 (the actual partition table area) remain zero.
     hdr[440..444].copy_from_slice(b"MTOS");
     hdr[444..448].copy_from_slice(&(mod_data.len() as u32).to_le_bytes());
     hdr[448..452].copy_from_slice(&4097u32.to_le_bytes());
     hdr[452..456].copy_from_slice(&1u32.to_le_bytes());
-    // Boot signature 0x55 0xAA already present at 510/511 from MBR_STUB.
-    match ata::write_sectors(target_addr, 0, 1, &hdr) {
+    match target_write(&target, 0, &hdr) {
         Ok(()) => vga::term_puts("OK\n", vga::C_GREEN),
         Err(e) => {
             vga::term_puts("FAIL: ", vga::C_RED);
@@ -1183,18 +1443,14 @@ fn do_install(arg: &str, mod_data: &[u8]) {
         }
     }
 
-    // ── Step 2: stream the model bundle to disk ──────────────────────────
+    // ── Step 2: stream bundle ────────────────────────────────────────────
     vga::term_puts("[install] writing bundle (", vga::C_CYAN);
     vga::term_putu32((mod_data.len() / (1024 * 1024)) as u32, vga::C_ORANGE);
     vga::term_puts(" MB) — do not power off\n", vga::C_CYAN);
-
-    // Save current cursor so the progress bar overwrites itself.
-    vga::term_puts("[install] progress: ", vga::C_DIM);
     let mut last_pct: u32 = 0;
-    match ata::install_image(target_addr, 4097, mod_data, |w, t| {
+    match target_stream(&target, 4097, mod_data, |w, t| {
         let pct = ((w as u64) * 100 / (t.max(1) as u64)) as u32;
         if pct != last_pct {
-            // Update an in-place 3-digit percentage in the status bar.
             vga::update_status_tokens(pct, 0);
             last_pct = pct;
         }
@@ -1212,16 +1468,16 @@ fn do_install(arg: &str, mod_data: &[u8]) {
         }
     }
 
-    // ── Step 3: verify by reading MBR back ───────────────────────────────
+    // ── Step 3: verify ───────────────────────────────────────────────────
     let mut verify = [0u8; 512];
-    if ata::read_sectors(target_addr, 0, 1, &mut verify).is_ok()
+    if target_read(&target, 0, &mut verify).is_ok()
         && &verify[440..444] == b"MTOS"
         && verify[510] == 0x55 && verify[511] == 0xAA
     {
         vga::term_puts("[install] verified MBR magic + boot signature.\n", vga::C_GREEN);
         vga::term_puts("[install] INSTALL COMPLETE — disk is now bootable.\n", vga::C_GREEN);
-        vga::term_puts("[install] (Boots to a banner.  Real disk-boot of the kernel\n", vga::C_DIM);
-        vga::term_puts("[install]  is queued — for full OS use the ISO + /install.)\n", vga::C_DIM);
+        vga::term_puts("[install] (Boots to a banner.  Real kernel-from-disk is\n", vga::C_DIM);
+        vga::term_puts("[install]  queued.  For full OS use ISO + /install.)\n", vga::C_DIM);
     } else {
         vga::term_puts("[install] WARNING: verify failed\n", vga::C_RED);
     }
@@ -1543,6 +1799,65 @@ fn try_create_app_via_ai(
 
     vga::term_puts("[give-up] could not produce a valid recipe in 4 rounds.\n", vga::C_RED);
     vga::term_puts("Try a simpler description, or write the recipe yourself.\n", vga::C_DIM);
+}
+
+/// Resolve a hostname to an IPv4 via the configured DNS server.
+/// Uses the same e1000 Driver + ARP-of-gateway approach as /ping.
+/// Returns Err on parse / timeout failures.
+fn resolve_host(host: &str) -> Result<[u8; 4], &'static str> {
+    let hhdm = unsafe { HHDM_OFFSET };
+    let our_ip = unsafe { OUR_IP };
+    let dns_ip = unsafe { DNS_IP };
+    let gateway = unsafe { GATEWAY_IP };
+
+    let nic = net::probe(hhdm).ok_or("no NIC")?;
+    let mut drv = net::Driver::init(nic, hhdm);
+    let mut cache = net::ArpCache::new();
+
+    // ARP the gateway (or DNS server directly if on same subnet — we just
+    // ARP the gateway since DNS replies traverse it anyway).
+    let arp_target = gateway;
+    drv.send_arp(our_ip, arp_target).map_err(|_| "ARP TX fail")?;
+    let mut gw_mac: Option<[u8; 6]> = None;
+    for _ in 0..400_000u32 {
+        if let Some((idx, _)) = drv.poll_rx() {
+            let f = drv.rx_frame(idx);
+            if let Some(reply) = net::process_arp(f, &mut cache, drv.nic.mac, our_ip) {
+                let _ = drv.send(&reply);
+            }
+            if let Some(m) = cache.lookup(arp_target) { gw_mac = Some(m); break; }
+        }
+        unsafe { core::arch::asm!("pause"); }
+    }
+    let gw_mac = gw_mac.ok_or("ARP timeout")?;
+
+    // Build DNS query
+    let xid: u16 = math::rdtsc() as u16;
+    let mut dns_q = [0u8; 512];
+    let dq_len = net::build_dns_query(host, xid, &mut dns_q).ok_or("DNS query encode failed")?;
+    let mut frame = [0u8; 1500];
+    let n = net::build_udp(
+        drv.nic.mac, our_ip, 53_000 + (xid & 0x0FFF),
+        gw_mac, dns_ip, net::DNS_PORT,
+        &dns_q[..dq_len], &mut frame,
+    ).ok_or("UDP build failed")?;
+    drv.send(&frame[..n]).map_err(|_| "UDP TX fail")?;
+
+    // Wait for reply
+    for _ in 0..2_000_000u32 {
+        if let Some((idx, _)) = drv.poll_rx() {
+            let f = drv.rx_frame(idx);
+            if let Some(pkt) = net::parse_udp(f) {
+                if pkt.src_port == net::DNS_PORT {
+                    if let Some(ip) = net::parse_dns_a_reply(pkt.payload, xid) {
+                        return Ok(ip);
+                    }
+                }
+            }
+        }
+        unsafe { core::arch::asm!("pause"); }
+    }
+    Err("DNS reply timeout")
 }
 
 /// Print an IPv4 as dotted-quad to the terminal.

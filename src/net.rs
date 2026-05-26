@@ -716,6 +716,111 @@ pub fn parse_dhcp(payload: &[u8]) -> Option<(u8, DhcpLease)> {
     Some((msg_type, lease))
 }
 
+// ── DNS resolver ────────────────────────────────────────────────────────────
+//
+// Standard DNS over UDP/53.  Builds an A-record query for one hostname,
+// parses the first IPv4 answer.  Handles RFC 1035 label compression
+// (0xC0 pointer bytes).  Returns Err for any wire-format weirdness so
+// the caller can decide what to do.
+
+pub const DNS_PORT: u16 = 53;
+
+/// Build a DNS A-record query for `host` with transaction id `xid`.
+/// Writes into `out`, returns the length used.
+pub fn build_dns_query(host: &str, xid: u16, out: &mut [u8]) -> Option<usize> {
+    if out.len() < 12 + host.len() + 6 { return None; }
+    // Header
+    out[0..2].copy_from_slice(&xid.to_be_bytes());
+    out[2..4].copy_from_slice(&0x0100u16.to_be_bytes()); // standard query + RD
+    out[4..6].copy_from_slice(&1u16.to_be_bytes());      // qdcount = 1
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());      // ancount
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());     // nscount
+    out[10..12].copy_from_slice(&0u16.to_be_bytes());    // arcount
+    let mut o = 12usize;
+
+    // Encode hostname as labels: "example.com" -> 7 example 3 com 0
+    let mut label_start = 0usize;
+    for (i, &b) in host.as_bytes().iter().enumerate() {
+        if b == b'.' {
+            let len = i - label_start;
+            if len == 0 || len > 63 { return None; }
+            if o + 1 + len > out.len() { return None; }
+            out[o] = len as u8;
+            out[o + 1..o + 1 + len].copy_from_slice(&host.as_bytes()[label_start..i]);
+            o += 1 + len;
+            label_start = i + 1;
+        }
+    }
+    // Last label
+    let len = host.len() - label_start;
+    if len == 0 || len > 63 { return None; }
+    if o + 1 + len + 5 > out.len() { return None; }
+    out[o] = len as u8;
+    out[o + 1..o + 1 + len].copy_from_slice(&host.as_bytes()[label_start..]);
+    o += 1 + len;
+    out[o] = 0; o += 1;                                  // root terminator
+    out[o..o + 2].copy_from_slice(&1u16.to_be_bytes());  // QTYPE = A
+    o += 2;
+    out[o..o + 2].copy_from_slice(&1u16.to_be_bytes());  // QCLASS = IN
+    o += 2;
+    Some(o)
+}
+
+/// Skip a domain name in `pkt` starting at offset `pos`, returning the
+/// offset after the name.  Handles compression pointers.
+fn dns_skip_name(pkt: &[u8], pos: usize) -> Option<usize> {
+    let mut p = pos;
+    loop {
+        if p >= pkt.len() { return None; }
+        let b = pkt[p];
+        if b == 0 { return Some(p + 1); }
+        if b & 0xC0 == 0xC0 {
+            // Compression pointer — 2 bytes, then we're done.
+            return Some(p + 2);
+        }
+        // Label of `b` bytes follows.
+        p += 1 + b as usize;
+    }
+}
+
+/// Parse a DNS reply for `xid` and return the first IPv4 A-record in
+/// its answer section.
+pub fn parse_dns_a_reply(pkt: &[u8], xid: u16) -> Option<[u8; 4]> {
+    if pkt.len() < 12 { return None; }
+    let id  = u16::from_be_bytes([pkt[0], pkt[1]]);
+    if id != xid { return None; }
+    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    if flags & 0x8000 == 0 { return None; }    // not a response
+    if flags & 0x000F != 0 { return None; }    // RCODE != 0
+    let qd = u16::from_be_bytes([pkt[4], pkt[5]]);
+    let an = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if an == 0 { return None; }
+
+    let mut p = 12usize;
+    // Skip questions: name + 2 + 2
+    for _ in 0..qd {
+        p = dns_skip_name(pkt, p)?;
+        if p + 4 > pkt.len() { return None; }
+        p += 4;
+    }
+    // Walk answers, return first A type=1, class=1, rdlen=4
+    for _ in 0..an {
+        p = dns_skip_name(pkt, p)?;
+        if p + 10 > pkt.len() { return None; }
+        let atype  = u16::from_be_bytes([pkt[p], pkt[p+1]]);
+        let aclass = u16::from_be_bytes([pkt[p+2], pkt[p+3]]);
+        let _ttl   = u32::from_be_bytes([pkt[p+4], pkt[p+5], pkt[p+6], pkt[p+7]]);
+        let rdlen  = u16::from_be_bytes([pkt[p+8], pkt[p+9]]) as usize;
+        p += 10;
+        if p + rdlen > pkt.len() { return None; }
+        if atype == 1 && aclass == 1 && rdlen == 4 {
+            return Some([pkt[p], pkt[p+1], pkt[p+2], pkt[p+3]]);
+        }
+        p += rdlen;
+    }
+    None
+}
+
 // ── TCP layer (minimal) ─────────────────────────────────────────────────────
 //
 // Just enough to do a 3-way handshake, send one payload, receive whatever
