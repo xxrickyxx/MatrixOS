@@ -25,6 +25,7 @@ pub mod bootstub;
 pub mod irq;
 pub mod ahci;
 pub mod fs;
+pub mod mouse;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -175,6 +176,9 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
             }
         }
         if !produced_something {
+            // Refresh mouse cursor while idle — cheap (fill_rect on a
+            // 12×12 box only when the position actually changed).
+            mouse::draw_cursor(vga::C_BG);
             unsafe { core::arch::asm!("pause"); }
         }
     }
@@ -1687,6 +1691,57 @@ fn run_one_tool(
             vga::clear_chat();
             vga::term_puts("cleared\n", vga::C_GREEN);
         }
+        // Filesystem tool calls: <<TOOL: fs.save name body...>>
+        //                       <<TOOL: fs.load name>>
+        //                       <<TOOL: fs.list>>
+        "fs.save" => {
+            let (name, body) = match arg.find(char::is_whitespace) {
+                Some(i) => (&arg[..i], arg[i..].trim_start()),
+                None    => (arg, ""),
+            };
+            if name.is_empty() {
+                vga::term_puts("fs.save: missing name", vga::C_RED);
+            } else {
+                match fs::save(name, body.as_bytes()) {
+                    Ok(()) => { vga::term_puts("fs.save ", vga::C_GREEN); vga::term_puts(name, vga::C_GREEN); vga::term_puts(" ok", vga::C_GREEN); }
+                    Err(e) => { vga::term_puts("fs.save error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); }
+                }
+            }
+        }
+        "fs.load" => {
+            if arg.is_empty() {
+                vga::term_puts("fs.load: missing name", vga::C_RED);
+            } else {
+                match fs::load(arg) {
+                    Ok(data) => {
+                        vga::term_puts("fs.load ", vga::C_GREEN);
+                        vga::term_puts(arg, vga::C_GREEN);
+                        vga::term_puts(":\n", vga::C_DIM);
+                        for &b in &data {
+                            if (32..127).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                                vga::term_putc(b, vga::C_TEXT);
+                            }
+                        }
+                    }
+                    Err(e) => { vga::term_puts("fs.load error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); }
+                }
+            }
+        }
+        "fs.list" => {
+            match fs::list() {
+                Ok(files) => {
+                    vga::term_puts("fs.list:\n", vga::C_GREEN);
+                    for (name, size) in &files {
+                        vga::term_puts("  ", 0);
+                        vga::term_puts(name, vga::C_GREEN);
+                        vga::term_puts("  ", vga::C_DIM);
+                        vga::term_putu32(*size, vga::C_ORANGE);
+                        vga::term_puts(" bytes\n", vga::C_DIM);
+                    }
+                }
+                Err(e) => { vga::term_puts("fs.list error: ", vga::C_RED); vga::term_puts(e, vga::C_RED); }
+            }
+        }
         _ => {
             vga::term_puts("unknown tool: ", vga::C_RED);
             vga::term_puts(verb, vga::C_RED);
@@ -2104,6 +2159,18 @@ pub extern "C" fn _start() -> ! {
         irq::enable();
     }
     vga::term_puts("[OK] IRQ keyboard + PIT timer armed\n", vga::C_GREEN);
+
+    // PS/2 mouse — best effort; if absent, we silently skip and continue.
+    let mouse_ok = unsafe {
+        let ok = mouse::init();
+        if ok { mouse::unmask_irq12(); }
+        ok
+    };
+    if mouse_ok {
+        vga::term_puts("[OK] PS/2 mouse online (IRQ 12)\n", vga::C_GREEN);
+    } else {
+        vga::term_puts("[--] PS/2 mouse not detected\n", vga::C_DIM);
+    }
 
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 4, 0xFF, 0x00, 0xFF); }
 

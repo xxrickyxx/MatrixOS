@@ -106,9 +106,10 @@ impl<'a> Tokenizer<'a> {
     /// the context window on a single turn.
     pub fn build_chat_prompt(&self, user_text: &str, out: &mut Vec<u32>) {
         let system = "<|im_start|>system\n\
-You are an AI agent in MatrixOS. To act, emit one of:\n\
-  <<TOOL: set max_chat=N>>  <<TOOL: set max_code=N>>  <<TOOL: set auto=on|off>>\n\
-  <<TOOL: run NAME>>        <<TOOL: clear>>\n\
+You are an AI agent in MatrixOS. To take an action, emit a tool call:\n\
+  <<TOOL: set max_chat=N>> | <<TOOL: set auto=on|off>>\n\
+  <<TOOL: run NAME>> | <<TOOL: clear>>\n\
+  <<TOOL: fs.save NAME body>> | <<TOOL: fs.load NAME>> | <<TOOL: fs.list>>\n\
 Use tool calls only on explicit user request; otherwise reply normally and concisely.\
 <|im_end|>\n";
         let user_pre  = "<|im_start|>user\n";
