@@ -1,9 +1,10 @@
 use x86_64::instructions::port::Port;
 
 pub struct Keyboard {
-    data_port:   Port<u8>,
-    status_port: Port<u8>,
-    pub shift:   bool,
+    data_port:    Port<u8>,
+    status_port:  Port<u8>,
+    pub shift:    bool,
+    pub extended: bool,    // last byte was 0xE0
 }
 
 // Sentinel control characters returned for non-printable / special keys.
@@ -16,13 +17,18 @@ pub const KEY_F5:    char = '\x15';
 pub const KEY_F6:    char = '\x16';
 pub const KEY_ESC:   char = '\x1B';
 pub const KEY_TAB:   char = '\t';
+pub const KEY_UP:    char = '\x05';
+pub const KEY_DOWN:  char = '\x06';
+pub const KEY_LEFT:  char = '\x07';   // colliding with BEL but unused
+pub const KEY_RIGHT: char = '\x0C';   // FF — unused
 
 impl Keyboard {
     pub const fn new() -> Self {
         Self {
-            data_port:   Port::new(0x60),
-            status_port: Port::new(0x64),
-            shift:       false,
+            data_port:    Port::new(0x60),
+            status_port:  Port::new(0x64),
+            shift:        false,
+            extended:     false,
         }
     }
 
@@ -47,6 +53,21 @@ impl Keyboard {
     /// Track shift state.  Returns Some(char) for printable / handled keys
     /// (including F-key sentinels above), None otherwise.
     pub fn scancode_to_char(&mut self, scancode: u8) -> Option<char> {
+        // 0xE0 prefix = extended scancode follows (arrow keys, RCtrl, etc.)
+        if scancode == 0xE0 { self.extended = true; return None; }
+        if self.extended {
+            self.extended = false;
+            // Only handle MAKE codes for arrows; ignore breaks.
+            if scancode & 0x80 != 0 { return None; }
+            return match scancode {
+                0x48 => Some(KEY_UP),
+                0x50 => Some(KEY_DOWN),
+                0x4B => Some(KEY_LEFT),
+                0x4D => Some(KEY_RIGHT),
+                _    => None,
+            };
+        }
+
         // Shift make/break
         match scancode {
             0x2A | 0x36 => { self.shift = true;  return None; }

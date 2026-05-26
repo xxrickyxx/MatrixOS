@@ -132,9 +132,43 @@ enum LineEvent {
     Hotkey(char),
 }
 
+/// Command-history ring buffer (16 entries × 256 bytes).  Shared by
+/// every read_line_gui call so Up/Down recall the last N commands.
+const HIST_CAP: usize = 16;
+const HIST_LINE: usize = 256;
+static mut HIST: [[u8; HIST_LINE]; HIST_CAP] = [[0; HIST_LINE]; HIST_CAP];
+static mut HIST_LEN: [usize; HIST_CAP] = [0; HIST_CAP];
+static mut HIST_HEAD: usize = 0;   // next slot to write into
+static mut HIST_COUNT: usize = 0;  // number of valid entries (≤ HIST_CAP)
+
+fn hist_push(line: &[u8]) {
+    if line.is_empty() { return; }
+    unsafe {
+        let slot = HIST_HEAD;
+        let n = line.len().min(HIST_LINE);
+        HIST[slot][..n].copy_from_slice(&line[..n]);
+        HIST_LEN[slot] = n;
+        HIST_HEAD = (HIST_HEAD + 1) % HIST_CAP;
+        if HIST_COUNT < HIST_CAP { HIST_COUNT += 1; }
+    }
+}
+
+/// Get history entry `offset` back (1 = most recent).  Returns None if out
+/// of range.
+fn hist_get(offset: usize) -> Option<&'static [u8]> {
+    unsafe {
+        if offset == 0 || offset > HIST_COUNT { return None; }
+        // Walk backwards from HEAD by `offset` slots.
+        let slot = (HIST_HEAD + HIST_CAP - offset) % HIST_CAP;
+        let n = HIST_LEN[slot];
+        Some(&HIST[slot][..n])
+    }
+}
+
 fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
     let mut len = 0usize;
     let mut dirty = true;
+    let mut hist_pos: usize = 0;   // 0 = current (editable), N = history offset
 
     loop {
         if dirty {
@@ -149,15 +183,50 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
         let mut produced_something = false;
         while let Some(sc) = kb.read_scancode() {
             produced_something = true;
-            if sc & 0x80 != 0 && sc != 0xAA && sc != 0xB6 { continue; }
+            // Break codes: drop everything except shift make/break and the
+            // 0xE0 extended-key prefix.
+            if sc & 0x80 != 0 && sc != 0xAA && sc != 0xB6 && sc != 0xE0 { continue; }
             if let Some(ch) = kb.scancode_to_char(sc) {
                 match ch {
                     '\n' => {
                         vga::draw_input_line(&[], 0);
+                        // Push into history (skip duplicates of most recent).
+                        let line = &buf[..len];
+                        let dup = hist_get(1).map(|prev| prev == line).unwrap_or(false);
+                        if !dup { hist_push(line); }
                         return LineEvent::Line(len);
                     }
                     '\x08' => {
                         if len > 0 { len -= 1; dirty = true; }
+                    }
+                    keyboard::KEY_UP => {
+                        let want = hist_pos + 1;
+                        if let Some(prev) = hist_get(want) {
+                            let n = prev.len().min(buf.len() - 1);
+                            buf[..n].copy_from_slice(&prev[..n]);
+                            len = n;
+                            hist_pos = want;
+                            dirty = true;
+                        }
+                    }
+                    keyboard::KEY_DOWN => {
+                        if hist_pos > 1 {
+                            hist_pos -= 1;
+                            if let Some(prev) = hist_get(hist_pos) {
+                                let n = prev.len().min(buf.len() - 1);
+                                buf[..n].copy_from_slice(&prev[..n]);
+                                len = n;
+                                dirty = true;
+                            }
+                        } else if hist_pos == 1 {
+                            // Snap back to empty
+                            len = 0;
+                            hist_pos = 0;
+                            dirty = true;
+                        }
+                    }
+                    keyboard::KEY_LEFT | keyboard::KEY_RIGHT => {
+                        // No cursor-move yet; ignore.
                     }
                     c if (c as u32) < 0x20 && c != '\n' && c != '\x08'
                         || c == keyboard::KEY_TAB
@@ -169,6 +238,7 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
                         if len < buf.len() - 1 && (c as u32) < 128 {
                             buf[len] = c as u8;
                             len += 1;
+                            hist_pos = 0;   // editing breaks history navigation
                             dirty = true;
                         }
                     }
@@ -176,9 +246,10 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
             }
         }
         if !produced_something {
-            // Refresh mouse cursor while idle — cheap (fill_rect on a
-            // 12×12 box only when the position actually changed).
+            // Refresh mouse cursor + live clock while idle (each call is
+            // O(no-op) unless the underlying state has actually changed).
             mouse::draw_cursor(vga::C_BG);
+            vga::update_status_clock((irq::tick_ms() / 1000) as u32);
             unsafe { core::arch::asm!("pause"); }
         }
     }

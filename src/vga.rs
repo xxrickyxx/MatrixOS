@@ -511,6 +511,29 @@ pub fn clear_chat() {
     }
 }
 
+/// Paint a live "Up Xs" clock on the LEFT half of the status bar.
+/// Cheap: only updates when the second-integer changed.
+pub fn update_status_clock(secs: u32) {
+    static mut LAST_SECS: u32 = u32::MAX;
+    unsafe {
+        if LAST_SECS == secs { return; }
+        LAST_SECS = secs;
+        if FB_PTR.is_null() { return; }
+        let h = FB_HEIGHT;
+        let w = FB_WIDTH;
+        let sbar_y = h.saturating_sub(STATUS_H);
+        let _ = w;
+        // Clear the clock area (left ~140 px starting at sidebar edge)
+        let cx = SIDE_W + 8;
+        fill_rect(cx, sbar_y + 1, 140, STATUS_H - 2, C_HDR);
+        draw_str_at(cx, sbar_y + 4, "Up", C_DIM);
+        let mut bs = [0u8; 12];
+        let ss = u32_to_str(secs, &mut bs);
+        draw_str_at(cx + 3*CHAR_W, sbar_y + 4, ss, C_GREEN);
+        draw_str_at(cx + (3 + ss.len()) * CHAR_W, sbar_y + 4, "s", C_DIM);
+    }
+}
+
 /// Update the status bar token count + optional tok/s rate.
 /// `toks_per_sec == 0` means "not yet measured, keep previous rate".
 pub fn update_status_tokens(n: u32, toks_per_sec: u32) {
