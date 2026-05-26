@@ -27,6 +27,13 @@ impl Keyboard {
     }
 
     pub fn read_scancode(&mut self) -> Option<u8> {
+        // Prefer the IRQ-fed ring buffer — that's where scancodes accumulate
+        // safely under high-rate input (paste, computer-use).  Fallback to
+        // polling the data port if for any reason the IRQ path isn't wired
+        // (boot stages before interrupts are armed).
+        if let Some(b) = crate::irq::ring_pop() {
+            return Some(b);
+        }
         unsafe {
             let status = self.status_port.read();
             if status & 1 == 1 {

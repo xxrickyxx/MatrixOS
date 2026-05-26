@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![allow(static_mut_refs)]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
@@ -20,6 +21,8 @@ pub mod apps;
 pub mod ata;
 pub mod state;
 pub mod net;
+pub mod bootstub;
+pub mod irq;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -744,16 +747,25 @@ fn do_install(arg: &str, mod_data: &[u8]) {
         return;
     }
 
-    // ── Step 1: write the MatrixOS MBR header to LBA 0 ───────────────────
-    vga::term_puts("[install] writing MBR... ", vga::C_CYAN);
-    let mut hdr = [0u8; 512];
-    hdr[..8].copy_from_slice(b"MATRIXOS");
-    hdr[8..12].copy_from_slice(&1u32.to_le_bytes());                 // version
-    hdr[12..16].copy_from_slice(&(mod_data.len() as u32).to_le_bytes()); // bundle size
-    hdr[16..20].copy_from_slice(&4097u32.to_le_bytes());             // bundle LBA
-    hdr[20..24].copy_from_slice(&1u32.to_le_bytes());                // kernel LBA
-    hdr[510] = 0x55;
-    hdr[511] = 0xAA;
+    // ── Step 1: write the MatrixOS MBR with the bootstub to LBA 0 ───────
+    // The stub displays a banner + halts; full boot loader is the next PR.
+    // We OVERLAY the MATRIXOS metadata at byte 440 (4 bytes magic + 12 of
+    // sizes/offsets) so it sits inside the partition-table area where the
+    // bootstub doesn't reach.
+    vga::term_puts("[install] writing bootable MBR... ", vga::C_CYAN);
+    let mut hdr = bootstub::MBR_STUB;
+    // Overlay header in the "disk signature + reserved" area at byte 440
+    // (immediately before the partition table).  Layout:
+    //   440..444 = "MTOS"  (4-byte mini-magic)
+    //   444..448 = u32 bundle size
+    //   448..452 = u32 bundle LBA
+    //   452..456 = u32 kernel LBA
+    // Bytes 446..510 (the actual partition table area) remain zero.
+    hdr[440..444].copy_from_slice(b"MTOS");
+    hdr[444..448].copy_from_slice(&(mod_data.len() as u32).to_le_bytes());
+    hdr[448..452].copy_from_slice(&4097u32.to_le_bytes());
+    hdr[452..456].copy_from_slice(&1u32.to_le_bytes());
+    // Boot signature 0x55 0xAA already present at 510/511 from MBR_STUB.
     match ata::write_sectors(target_addr, 0, 1, &hdr) {
         Ok(()) => vga::term_puts("OK\n", vga::C_GREEN),
         Err(e) => {
@@ -796,11 +808,13 @@ fn do_install(arg: &str, mod_data: &[u8]) {
     // ── Step 3: verify by reading MBR back ───────────────────────────────
     let mut verify = [0u8; 512];
     if ata::read_sectors(target_addr, 0, 1, &mut verify).is_ok()
-        && &verify[..8] == b"MATRIXOS"
+        && &verify[440..444] == b"MTOS"
+        && verify[510] == 0x55 && verify[511] == 0xAA
     {
-        vga::term_puts("[install] verified MBR magic. INSTALL COMPLETE.\n", vga::C_GREEN);
-        vga::term_puts("[install] (bootloader stub not yet present — disk holds the\n", vga::C_DIM);
-        vga::term_puts("[install] kernel + bundle but BIOS boot needs a future fix.)\n", vga::C_DIM);
+        vga::term_puts("[install] verified MBR magic + boot signature.\n", vga::C_GREEN);
+        vga::term_puts("[install] INSTALL COMPLETE — disk is now bootable.\n", vga::C_GREEN);
+        vga::term_puts("[install] (Boots to a banner.  Real disk-boot of the kernel\n", vga::C_DIM);
+        vga::term_puts("[install]  is queued — for full OS use the ISO + /install.)\n", vga::C_DIM);
     } else {
         vga::term_puts("[install] WARNING: verify failed\n", vga::C_RED);
     }
@@ -1248,6 +1262,18 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { idt::init(); }
     vga::term_puts("[OK] IDT loaded\n", vga::C_GREEN);
+
+    // Remap the 8259 PIC pair so IRQ vectors don't collide with CPU
+    // exceptions, then unmask IRQ 1 (keyboard) and STI.  After this,
+    // scancodes accumulate in the ring buffer rather than being missed
+    // between polls (the "paste drops chars" issue).
+    unsafe {
+        irq::remap_pic();
+        irq::unmask_keyboard();
+        irq::enable();
+    }
+    vga::term_puts("[OK] IRQ keyboard armed (vector 0x21)\n", vga::C_GREEN);
+
     unsafe { stage_marker(fb_ptr, pitch, bpp, fb_w, 4, 0xFF, 0x00, 0xFF); }
 
     if !BASE_REVISION.is_supported() {
