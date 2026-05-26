@@ -23,6 +23,7 @@ pub mod state;
 pub mod net;
 pub mod bootstub;
 pub mod irq;
+pub mod ahci;
 
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
@@ -356,14 +357,42 @@ fn handle_slash_command(
             }
             if idx == 0 {
                 vga::term_puts("  (no ATA drives responded to IDENTIFY)\n", vga::C_DIM);
-                if ahci_count > 0 {
-                    vga::term_puts("  VM controller is AHCI — switch to legacy IDE in VirtualBox\n", vga::C_ORANGE);
-                    vga::term_puts("  (Settings -> Storage -> Controller: IDE, attach disk to it).\n", vga::C_ORANGE);
+            }
+
+            // Step 3 — AHCI / SATA drives via the new ahci.rs driver.
+            let ahci_probe = ahci::probe(unsafe { HHDM_OFFSET });
+            if ahci_probe.controller_present {
+                vga::term_puts("\nSATA / AHCI drives:\n", vga::C_CYAN);
+                if ahci_probe.drives.is_empty() {
+                    vga::term_puts("  controller present, no drives responded\n", vga::C_DIM);
                 } else {
-                    vga::term_puts("  Attach an IDE hard disk in the VM settings.\n", vga::C_DIM);
+                    for d in &ahci_probe.drives {
+                        vga::term_puts("  port ", vga::C_DIM);
+                        vga::term_putu32(d.port as u32, vga::C_ORANGE);
+                        vga::term_puts("  ", 0);
+                        vga::term_puts(d.model_str(), vga::C_TEXT);
+                        if d.is_atapi { vga::term_puts(" [ATAPI]", vga::C_DIM); }
+                        vga::term_puts("\n      sectors: ", vga::C_DIM);
+                        vga::term_putu32(d.sectors_48 as u32, vga::C_ORANGE);
+                        vga::term_puts("  size: ", vga::C_DIM);
+                        let gb10 = d.capacity_gb_x10();
+                        if gb10 >= 10 {
+                            vga::term_putu32(gb10 / 10, vga::C_ORANGE);
+                            vga::term_putc(b'.', vga::C_DIM);
+                            vga::term_putu32(gb10 % 10, vga::C_ORANGE);
+                            vga::term_puts(" GB\n", vga::C_DIM);
+                        } else {
+                            vga::term_putu32(d.capacity_mb(), vga::C_ORANGE);
+                            vga::term_puts(" MB\n", vga::C_DIM);
+                        }
+                    }
                 }
-            } else {
-                vga::term_puts("Use /install <slot> to install MatrixOS (dry-run).\n", vga::C_DIM);
+            }
+
+            if idx == 0 && ahci_probe.drives.is_empty() {
+                vga::term_puts("\nAttach an IDE or SATA disk in VM settings.\n", vga::C_DIM);
+            } else if idx > 0 {
+                vga::term_puts("Use /install <slot> to install (IDE only for now).\n", vga::C_DIM);
             }
         }
         "/install" => {
