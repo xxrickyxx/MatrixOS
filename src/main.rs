@@ -249,7 +249,20 @@ fn read_line_gui(kb: &mut keyboard::Keyboard, buf: &mut [u8]) -> LineEvent {
             // Refresh mouse cursor + live clock while idle (each call is
             // O(no-op) unless the underlying state has actually changed).
             mouse::draw_cursor(vga::C_BG);
-            vga::update_status_clock((irq::tick_ms() / 1000) as u32);
+            let ms = irq::tick_ms();
+            vga::update_status_clock((ms / 1000) as u32);
+
+            // Blink the input-line cursor at ~2 Hz.  Only repaint when the
+            // visibility state actually changes — cheap.
+            let blink_on = (ms / 500) % 2 == 0;
+            static mut LAST_BLINK: bool = true;
+            unsafe {
+                if blink_on != LAST_BLINK {
+                    LAST_BLINK = blink_on;
+                    vga::draw_input_line_blink(buf, len, blink_on);
+                }
+            }
+
             unsafe { core::arch::asm!("pause"); }
         }
     }
@@ -2703,7 +2716,14 @@ pub extern "C" fn _start() -> ! {
                     vga::term_putc(b' ', 0);
                 }
                 if total_tokens % 4 == 0 {
-                    vga::update_status_tokens(total_tokens, 0);
+                    // Rolling tok/s: tokens since tsc_start ÷ elapsed seconds.
+                    // Cheap because we already capture tsc_start at turn boot.
+                    let dt = math::rdtsc().wrapping_sub(tsc_start);
+                    let live_tps: u32 = if dt > 0 && turn_tokens > 0 {
+                        let num = (turn_tokens as u64).saturating_mul(math::tsc_hz());
+                        (num / dt) as u32
+                    } else { 0 };
+                    vga::update_status_tokens(total_tokens, live_tps);
                 }
             },
         );

@@ -566,6 +566,15 @@ pub fn update_status_tokens(n: u32, toks_per_sec: u32) {
 
 /// Draw (or refresh) the input line. `buf` is the current text, `len` the length.
 pub fn draw_input_line(buf: &[u8], len: usize) {
+    draw_input_line_inner(buf, len, true);
+}
+
+/// Blink-aware variant — caller passes the current cursor-visible state.
+pub fn draw_input_line_blink(buf: &[u8], len: usize, cursor_on: bool) {
+    draw_input_line_inner(buf, len, cursor_on);
+}
+
+fn draw_input_line_inner(buf: &[u8], len: usize, cursor_on: bool) {
     unsafe {
         if FB_PTR.is_null() { return; }
         let h       = FB_HEIGHT;
@@ -583,9 +592,11 @@ pub fn draw_input_line(buf: &[u8], len: usize) {
             let cx = text_x + i * CHAR_W;
             draw_char(FB_PTR, FB_PITCH, FB_BPP, cx, input_y + 8, c, C_TEXT);
         }
-        // Cursor
-        let cur_x = text_x + len.min(text_w / CHAR_W) * CHAR_W;
-        fill_rect(cur_x, input_y + 8, 6, CHAR_H - 2, C_GREEN);
+        // Cursor (blinking)
+        if cursor_on {
+            let cur_x = text_x + len.min(text_w / CHAR_W) * CHAR_W;
+            fill_rect(cur_x, input_y + 8, 6, CHAR_H - 2, C_GREEN);
+        }
     }
 }
 
